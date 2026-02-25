@@ -1,0 +1,5 @@
+langgraph>=0.2.53
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+tiktoken>=0.8.0
+python-dotenv>=1.0.1
