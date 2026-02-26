@@ -37,6 +37,7 @@ def execute_shell_command(cmd: str) -> str:
         capture_output=True,
     )
     combined = (
+        f"[cmd]={cmd}\n"
         f"[exit_code]={completed.returncode}\n"
         f"[stdout]\n{completed.stdout}\n"
         f"[stderr]\n{completed.stderr}"

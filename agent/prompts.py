@@ -21,6 +21,8 @@ Write a concise final report with:
 - Build/test outcome
 - Key commands executed
 - Root cause of failures (if any)
+- Environment sanity section (OS/toolchain/path factors)
+- Local-vs-upstream interpretation (whether failures may be environment-specific)
 - Suggested next steps
 
 Do not claim success without clear command evidence.

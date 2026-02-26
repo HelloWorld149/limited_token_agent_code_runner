@@ -6,11 +6,12 @@ import os
 @dataclass(frozen=True)
 class AgentConfig:
     model_name: str = os.getenv("AGENT_MODEL", "gpt-5.3-codex")
+    fallback_chat_model: str = os.getenv("AGENT_FALLBACK_CHAT_MODEL", "gpt-4o-mini")
     max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "15"))
     token_budget: int = int(os.getenv("AGENT_TOKEN_BUDGET", "5000"))
-    prune_threshold: int = int(os.getenv("AGENT_PRUNE_THRESHOLD", "3500"))
-    output_token_budget: int = int(os.getenv("AGENT_OUTPUT_TOKENS", "1500"))
-    input_token_budget: int = int(os.getenv("AGENT_INPUT_TOKENS", "3500"))
+    prune_threshold: int = int(os.getenv("AGENT_PRUNE_THRESHOLD", "4000"))
+    output_token_budget: int = int(os.getenv("AGENT_OUTPUT_TOKENS", "1000"))
+    input_token_budget: int = int(os.getenv("AGENT_INPUT_TOKENS", "4000"))
     repo_dir: Path = Path(os.getenv("AGENT_REPO_DIR", "workspace"))
     clone_url: str = "https://github.com/nlohmann/json"
 

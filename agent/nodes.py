@@ -54,11 +54,9 @@ def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, An
 def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     from agent.tools import ALL_TOOLS
 
-    model = ChatOpenAI(
-        model=config.model_name,
-        temperature=0,
-        max_tokens=config.output_token_budget,
-    ).bind_tools(ALL_TOOLS)
+    reasoner_output_budget = _reasoner_output_budget(config)
+
+    model = _build_chat_model(config.model_name, reasoner_output_budget).bind_tools(ALL_TOOLS)
 
     system = SystemMessage(content=REASONER_SYSTEM_PROMPT)
     summary_context = HumanMessage(content=f"Knowledge summary: {state['summary_of_knowledge']}")
@@ -95,6 +93,7 @@ def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     if dropped:
         summary_update = _summarize_messages(dropped)
         summary = _merge_summary(summary, summary_update)
+    summary = _cap_summary(summary, config)
 
     consecutive_errors = _compute_consecutive_errors(state)
     status = _infer_status(state)
@@ -108,18 +107,18 @@ def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
 
 def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    model = ChatOpenAI(
-        model=config.model_name,
-        temperature=0,
-        max_tokens=config.output_token_budget,
-    )
+    report_output_budget = _report_output_budget(config)
+
+    model = _build_chat_model(config.model_name, report_output_budget)
     system = SystemMessage(content=REPORT_SYSTEM_PROMPT)
+    environment_facts = _collect_environment_facts(config)
     report_request = HumanMessage(
         content=(
             f"Status: {state['status']}\n"
             f"Consecutive errors: {state['consecutive_errors']}\n"
             f"Step count: {state['step_count']}\n"
             f"Knowledge summary: {state['summary_of_knowledge']}\n"
+            f"Environment facts:\n{environment_facts}\n"
             "Use recent messages as evidence and produce the final report."
         )
     )
@@ -135,7 +134,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
 
 def route_from_reasoner(state: AgentState, config: AgentConfig) -> str:
-    if state["step_count"] > config.max_steps:
+    if state["step_count"] >= config.max_steps:
         return "generate_report"
 
     last = _last_ai_message(state["messages"])
@@ -152,20 +151,68 @@ def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
 
 
 def _summarize_messages(messages: list[BaseMessage]) -> str:
-    snippets: list[str] = []
-    for message in messages[-4:]:
-        text = str(message.content).replace("\n", " ").strip()
-        if text:
-            snippets.append(text[:120])
-    if not snippets:
-        return "Older tool interactions were pruned to preserve context budget."
-    return "Pruned tool context covered: " + " | ".join(snippets) + "."
+    if not messages:
+        return "Pruned context contained no actionable tool details."
+
+    findings: list[str] = []
+    commands: list[str] = []
+    errors: list[str] = []
+    files: list[str] = []
+
+    for message in messages:
+        text = str(message.content)
+        lowered = text.lower()
+
+        cmd_line = _extract_cmd(text)
+        if cmd_line:
+            commands.append(cmd_line[:160])
+
+        if "[exit_code]" in lowered:
+            exit_line = _first_matching_line(text, r"\[exit_code\]\s*=\s*\d+|\[exit_code\]=\d+")
+            if exit_line:
+                findings.append(exit_line)
+
+            if "ctest" in lowered:
+                test_summary = _extract_test_summary(text)
+                if test_summary:
+                    findings.append(test_summary)
+            if "cmake --build" in lowered or "ninja" in lowered or "make" in lowered:
+                build_summary = _extract_build_summary(text)
+                if build_summary:
+                    findings.append(build_summary)
+
+        error_line = _first_matching_line(text, r".*\b(error|failed|fatal)\b.*")
+        if error_line:
+            errors.append(error_line[:160])
+
+        file_line = _first_matching_line(text, r"[\w\-./\\]+\.(cpp|cc|cxx|h|hpp|cmake|txt):\d+")
+        if file_line:
+            files.append(file_line[:140])
+
+    parts: list[str] = []
+    if commands:
+        parts.append("commands=" + " ; ".join(_unique_keep_order(commands)[:2]))
+    if findings:
+        parts.append("results=" + " ; ".join(_unique_keep_order(findings)[:2]))
+    if errors:
+        parts.append("errors=" + " ; ".join(_unique_keep_order(errors)[:2]))
+    if files:
+        parts.append("files=" + " ; ".join(_unique_keep_order(files)[:2]))
+
+    if not parts:
+        return "Pruned tool context had no retained build/test/error signals."
+    return "Pruned context summary: " + " | ".join(parts) + "."
 
 
 def _merge_summary(existing: str, update: str) -> str:
     if not existing:
         return update
     return f"{existing} {update}".strip()
+
+
+def _cap_summary(summary: str, config: AgentConfig) -> str:
+    max_summary_tokens = max(256, min(1200, config.input_token_budget // 3))
+    return trim_text_to_token_budget(summary, config.model_name, max_summary_tokens)
 
 
 def _compute_consecutive_errors(state: AgentState) -> int:
@@ -199,15 +246,27 @@ def _infer_status(state: AgentState) -> str:
     if not tool_messages:
         return state["status"]
 
-    last = str(tool_messages[-1].content).lower()
-    if "ctest" in last or "test" in last:
-        if "100% tests passed" in last or "passed" in last and "failed" not in last:
+    last_text = str(tool_messages[-1].content)
+    last = last_text.lower()
+    if "[cmd]=" not in last and "[exit_code]=" not in last:
+        return state["status"]
+
+    cmd = (_extract_cmd(last_text) or "").lower()
+    exit_code = _extract_exit_code(last_text)
+
+    if "ctest" in cmd:
+        if exit_code == 0:
             return "SUCCESS"
-        return "TESTING"
-    if "cmake" in last or "ninja" in last or "build" in last:
-        if "error" in last or "failed" in last:
-            return "FAILED"
-        return "BUILDING"
+        return "FAILED"
+
+    if "cmake --build" in cmd or "ninja" in cmd or re.search(r"\bmake\b", cmd):
+        if exit_code is None:
+            return "BUILDING"
+        return "FAILED" if exit_code != 0 else "BUILDING"
+
+    if exit_code is not None:
+        return "FAILED" if exit_code != 0 else state["status"]
+
     return state["status"]
 
 
@@ -291,3 +350,131 @@ def _pop_oldest_tool_observation_pair(messages: list[BaseMessage]) -> list[BaseM
     removed.append(messages.pop(ai_index))
     removed.reverse()
     return removed
+
+
+def _reasoner_output_budget(config: AgentConfig) -> int:
+    return max(256, min(700, config.output_token_budget // 2))
+
+
+def _report_output_budget(config: AgentConfig) -> int:
+    return max(512, config.output_token_budget)
+
+
+def _first_matching_line(text: str, pattern: str) -> str | None:
+    regex = re.compile(pattern, flags=re.IGNORECASE)
+    for line in text.splitlines():
+        if regex.search(line):
+            return line.strip()
+    return None
+
+
+def _extract_cmd(text: str) -> str | None:
+    line = _first_matching_line(text, r"\[cmd\]=.+")
+    if not line:
+        return None
+    return line.split("=", 1)[1].strip()
+
+
+def _extract_exit_code(text: str) -> int | None:
+    line = _first_matching_line(text, r"\[exit_code\]\s*=\s*\d+|\[exit_code\]=\d+")
+    if not line:
+        return None
+    match = re.search(r"(\d+)", line)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _extract_test_summary(text: str) -> str | None:
+    total_line = _first_matching_line(text, r"\d+% tests passed, \d+ tests failed out of \d+")
+    if total_line:
+        return total_line
+    pass_line = _first_matching_line(text, r"100% tests passed")
+    if pass_line:
+        return pass_line
+    return None
+
+
+def _extract_build_summary(text: str) -> str | None:
+    built_targets = len(re.findall(r"Built target ", text))
+    if built_targets > 0:
+        return f"Built targets observed: {built_targets}"
+    return None
+
+
+def _unique_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _build_chat_model(model_name: str, max_tokens: int) -> ChatOpenAI:
+    kwargs = {
+        "model": model_name,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+
+    if _is_codex_or_gpt5_model(model_name):
+        try:
+            return ChatOpenAI(**kwargs, use_responses_api=True)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Codex/GPT-5 models require Responses API support in your langchain-openai version. "
+                "Please upgrade langchain-openai and openai packages, then retry."
+            ) from exc
+
+    return ChatOpenAI(**kwargs)
+
+
+def _is_codex_or_gpt5_model(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return "codex" in lowered or lowered.startswith("gpt-5")
+
+
+def _collect_environment_facts(config: AgentConfig) -> str:
+    facts: list[str] = []
+    cwd = Path.cwd()
+    repo_path = config.repo_dir / "json"
+
+    facts.append(f"cwd={cwd}")
+    facts.append(f"cwd_path_length={len(str(cwd))}")
+    facts.append(f"repo_path={repo_path}")
+    facts.append(f"repo_path_length={len(str(repo_path))}")
+    facts.append(f"os_name={os.name}")
+
+    for cmd, label in [
+        ("python --version", "python"),
+        ("cmake --version", "cmake"),
+        ("g++ --version", "gxx"),
+        ("git --version", "git"),
+        ("git config --get core.longpaths", "git_core_longpaths"),
+    ]:
+        output = _run_quick_command(cmd)
+        if output:
+            facts.append(f"{label}={output}")
+
+    if len(str(repo_path)) > 120:
+        facts.append("path_length_risk=high")
+    else:
+        facts.append("path_length_risk=low")
+
+    return "\n".join(facts)
+
+
+def _run_quick_command(cmd: str) -> str:
+    try:
+        result = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=5)
+    except Exception:
+        return ""
+
+    text = (result.stdout or result.stderr or "").strip()
+    if not text:
+        return ""
+    first_line = text.splitlines()[0].strip()
+    return first_line[:200]
