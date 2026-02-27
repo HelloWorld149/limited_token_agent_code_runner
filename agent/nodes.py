@@ -69,6 +69,7 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         model_name=config.model_name,
         input_budget=config.input_token_budget,
     )
+    messages_for_model = _sanitize_tool_message_sequence(messages_for_model)
 
     response = model.invoke(messages_for_model)
 
@@ -100,6 +101,8 @@ def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             else:
                 break
         token_count = estimate_token_count(messages, config.model_name)
+
+    messages = _sanitize_tool_message_sequence(messages)
 
     summary = state["summary_of_knowledge"]
     if dropped:
@@ -143,6 +146,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         model_name=config.model_name,
         input_budget=config.input_token_budget,
     )
+    report_messages = _sanitize_tool_message_sequence(report_messages)
     response = model.invoke(report_messages)
     return {"messages": [response]}
 
@@ -443,6 +447,30 @@ def _is_important_tool_output(text: str) -> bool:
         return True
 
     return False
+
+
+def _sanitize_tool_message_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:
+    allowed_call_ids: set[str] = set()
+    sanitized: list[BaseMessage] = []
+
+    for message in messages:
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            for tool_call in getattr(message, "tool_calls", []) or []:
+                call_id = str(tool_call.get("id", "")).strip()
+                if call_id:
+                    allowed_call_ids.add(call_id)
+            sanitized.append(message)
+            continue
+
+        if isinstance(message, ToolMessage):
+            call_id = str(getattr(message, "tool_call_id", "") or "").strip()
+            if call_id and call_id in allowed_call_ids:
+                sanitized.append(message)
+            continue
+
+        sanitized.append(message)
+
+    return sanitized
 
 
 def _reasoner_output_budget(config: AgentConfig) -> int:
