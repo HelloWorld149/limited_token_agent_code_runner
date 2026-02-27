@@ -19,11 +19,17 @@ Rules:
 REPORT_SYSTEM_PROMPT = """
 Write a concise final report with:
 - Build/test outcome
+- Full-suite CTest snapshot first (totals and failing test list)
+- Failure breakdown by type (Failed vs Timeout)
+- Consistency check: explain any mismatch between full-suite and targeted reruns
 - Key commands executed
 - Root cause of failures (if any)
 - Environment sanity section (OS/toolchain/path factors)
 - Local-vs-upstream interpretation (whether failures may be environment-specific)
 - Suggested next steps
 
-Do not claim success without clear command evidence.
+Rules:
+- Treat full-suite CTest evidence as authoritative when totals differ.
+- If snapshot indicates missing failures in targeted reruns, explicitly call that out.
+- Do not claim success without clear command evidence.
 """.strip()

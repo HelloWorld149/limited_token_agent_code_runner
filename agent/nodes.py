@@ -117,6 +117,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     model = _build_chat_model(config.model_name, report_output_budget)
     system = SystemMessage(content=REPORT_SYSTEM_PROMPT)
     environment_facts = _collect_environment_facts(config)
+    ctest_snapshot = _build_ctest_evidence_snapshot(state)
     report_request = HumanMessage(
         content=(
             f"Status: {state['status']}\n"
@@ -124,6 +125,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             f"Step count: {state['step_count']}\n"
             f"Knowledge summary: {state['summary_of_knowledge']}\n"
             f"Environment facts:\n{environment_facts}\n"
+            f"CTest evidence snapshot:\n{ctest_snapshot}\n"
             "Use recent messages as evidence and produce the final report."
         )
     )
@@ -515,3 +517,128 @@ def _run_quick_command(cmd: str) -> str:
         return ""
     first_line = text.splitlines()[0].strip()
     return first_line[:200]
+
+
+def _build_ctest_evidence_snapshot(state: AgentState) -> str:
+    tool_messages = [msg for msg in state.get("messages", []) if isinstance(msg, ToolMessage)]
+    ctest_records: list[dict[str, Any]] = []
+
+    for message in tool_messages:
+        text = str(message.content)
+        cmd = _extract_cmd(text)
+        if not cmd or "ctest" not in cmd.lower():
+            continue
+
+        summary = _extract_test_summary(text) or "<no test summary line found>"
+        failures = _extract_failed_tests(text)
+        if not failures:
+            failures = _extract_inline_failed_tests(text)
+
+        ctest_records.append(
+            {
+                "cmd": cmd,
+                "summary": summary,
+                "failures": failures,
+                "is_targeted": bool(re.search(r"(^|\s)-R(\s|=)", cmd)),
+            }
+        )
+
+    if not ctest_records:
+        return "No ctest command output found in retained messages."
+
+    full_runs = [record for record in ctest_records if not record["is_targeted"]]
+    targeted_runs = [record for record in ctest_records if record["is_targeted"]]
+
+    latest_full = full_runs[-1] if full_runs else None
+    latest_targeted = targeted_runs[-1] if targeted_runs else None
+
+    lines: list[str] = []
+    lines.append(f"ctest_runs_observed={len(ctest_records)}")
+
+    if latest_full:
+        lines.append(f"full_suite_cmd={latest_full['cmd']}")
+        lines.append(f"full_suite_summary={latest_full['summary']}")
+        lines.extend(_format_failure_type_lines("full_suite", latest_full["failures"]))
+    else:
+        lines.append("full_suite_summary=<missing in retained context>")
+
+    if latest_targeted:
+        lines.append(f"targeted_cmd={latest_targeted['cmd']}")
+        lines.append(f"targeted_summary={latest_targeted['summary']}")
+        lines.extend(_format_failure_type_lines("targeted", latest_targeted["failures"]))
+    else:
+        lines.append("targeted_summary=<none observed>")
+
+    if latest_full and latest_targeted:
+        full_names = {entry["name"] for entry in latest_full["failures"]}
+        targeted_names = {entry["name"] for entry in latest_targeted["failures"]}
+        missing_from_targeted = sorted(name for name in full_names if name and name not in targeted_names)
+        extra_in_targeted = sorted(name for name in targeted_names if name and name not in full_names)
+
+        lines.append(f"consistency_missing_from_targeted={missing_from_targeted or ['<none>']}")
+        lines.append(f"consistency_extra_in_targeted={extra_in_targeted or ['<none>']}")
+
+    lines.append("report_rule=prioritize full_suite_* lines over targeted_* lines when totals differ")
+    return "\n".join(lines)
+
+
+def _extract_failed_tests(text: str) -> list[dict[str, str]]:
+    lines = text.splitlines()
+    section_index = None
+    for index, line in enumerate(lines):
+        if "The following tests FAILED" in line:
+            section_index = index
+            break
+
+    if section_index is None:
+        return []
+
+    results: list[dict[str, str]] = []
+    pattern = re.compile(r"^\s*\d+\s*-\s*([^\(]+?)\s*\((Failed|Timeout)\)")
+    for line in lines[section_index + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = pattern.search(stripped)
+        if not match:
+            if stripped.lower().startswith("errors while running ctest"):
+                break
+            continue
+        results.append({"name": match.group(1).strip(), "type": match.group(2).strip()})
+    return results
+
+
+def _extract_inline_failed_tests(text: str) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    pattern = re.compile(r"Test\s+#?\d+:\s*([\w\-\.]+)\s*\.*\*\*\*(Failed|Timeout)", re.IGNORECASE)
+
+    for line in text.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        failure_type = match.group(2).capitalize()
+        key = (name, failure_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({"name": name, "type": failure_type})
+
+    return results
+
+
+def _format_failure_type_lines(prefix: str, failures: list[dict[str, str]]) -> list[str]:
+    if not failures:
+        return [f"{prefix}_failed_tests=[]", f"{prefix}_failure_type_counts={{}}"]
+
+    names = sorted({entry["name"] for entry in failures if entry.get("name")})
+    counts: dict[str, int] = {}
+    for entry in failures:
+        failure_type = entry.get("type", "Unknown")
+        counts[failure_type] = counts.get(failure_type, 0) + 1
+
+    return [
+        f"{prefix}_failed_tests={names}",
+        f"{prefix}_failure_type_counts={counts}",
+    ]
