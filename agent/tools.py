@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -30,19 +31,30 @@ def _safe_relative(path: Path, root: Path) -> str:
 @tool
 def execute_shell_command(cmd: str) -> str:
     """Run a shell command and capture both stdout and stderr with truncation logic."""
+    normalized_cmd = _normalize_command_for_platform(cmd)
     completed = subprocess.run(
-        cmd,
+        normalized_cmd,
         shell=True,
         text=True,
         capture_output=True,
     )
     combined = (
-        f"[cmd]={cmd}\n"
+        f"[cmd]={normalized_cmd}\n"
         f"[exit_code]={completed.returncode}\n"
         f"[stdout]\n{completed.stdout}\n"
         f"[stderr]\n{completed.stderr}"
     )
     return _truncate_output(combined)
+
+
+def _normalize_command_for_platform(cmd: str) -> str:
+    if os.name != "nt":
+        return cmd
+
+    normalized = cmd
+    normalized = re.sub(r"(^|[\s;&|])\./", r"\1", normalized)
+    normalized = normalized.replace("build/tests/", "build\\tests\\")
+    return normalized
 
 
 @tool

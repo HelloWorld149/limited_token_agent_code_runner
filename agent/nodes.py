@@ -87,11 +87,18 @@ def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     dropped: list[BaseMessage] = []
 
     while token_count > config.prune_threshold and len(messages) > 4:
-        pair = _pop_oldest_tool_observation_pair(messages)
+        protected_indexes = _important_message_indexes(messages)
+        pair = _pop_oldest_tool_observation_pair(messages, protected_indexes)
         if pair:
             dropped.extend(pair)
         else:
-            dropped.append(messages.pop(0))
+            removed = _pop_oldest_non_protected_message(messages, protected_indexes)
+            if removed is None and messages:
+                removed = messages.pop(0)
+            if removed is not None:
+                dropped.append(removed)
+            else:
+                break
         token_count = estimate_token_count(messages, config.model_name)
 
     summary = state["summary_of_knowledge"]
@@ -295,8 +302,12 @@ def _fit_reasoner_messages_to_budget(
         if tokens <= input_budget:
             return candidate_messages
 
-        pair = _pop_oldest_tool_observation_pair(current_history)
+        protected_indexes = _important_message_indexes(current_history)
+        pair = _pop_oldest_tool_observation_pair(current_history, protected_indexes)
         if pair:
+            continue
+        removed = _pop_oldest_non_protected_message(current_history, protected_indexes)
+        if removed is not None:
             continue
         if current_history:
             current_history.pop(0)
@@ -322,8 +333,12 @@ def _fit_report_messages_to_budget(
         if tokens <= input_budget:
             return candidate
 
-        pair = _pop_oldest_tool_observation_pair(current_history)
+        protected_indexes = _important_message_indexes(current_history)
+        pair = _pop_oldest_tool_observation_pair(current_history, protected_indexes)
         if pair:
+            continue
+        removed = _pop_oldest_non_protected_message(current_history, protected_indexes)
+        if removed is not None:
             continue
         if current_history:
             current_history.pop(0)
@@ -332,31 +347,102 @@ def _fit_report_messages_to_budget(
         return [system, HumanMessage(content=request_text)]
 
 
-def _pop_oldest_tool_observation_pair(messages: list[BaseMessage]) -> list[BaseMessage]:
+def _pop_oldest_tool_observation_pair(
+    messages: list[BaseMessage],
+    protected_indexes: set[int] | None = None,
+) -> list[BaseMessage]:
+    protected = protected_indexes or set()
+
     ai_index = None
+    pair_indexes: list[int] = []
+
     for index, message in enumerate(messages):
-        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-            ai_index = index
-            break
+        if not (isinstance(message, AIMessage) and getattr(message, "tool_calls", None)):
+            continue
+
+        candidate_indexes = [index]
+        for tool_index in range(index + 1, len(messages)):
+            if isinstance(messages[tool_index], ToolMessage):
+                candidate_indexes.append(tool_index)
+            elif isinstance(messages[tool_index], AIMessage):
+                break
+
+        if any(candidate_index in protected for candidate_index in candidate_indexes):
+            continue
+
+        ai_index = index
+        pair_indexes = candidate_indexes
+        break
 
     if ai_index is None:
         return []
 
-    tool_indexes: list[int] = []
-    for index in range(ai_index + 1, len(messages)):
-        if isinstance(messages[index], ToolMessage):
-            tool_indexes.append(index)
-        elif isinstance(messages[index], AIMessage):
-            break
-
     removed: list[BaseMessage] = []
-    if tool_indexes:
-        for index in sorted(tool_indexes, reverse=True):
-            removed.append(messages.pop(index))
+    for index in sorted(pair_indexes, reverse=True):
+        removed.append(messages.pop(index))
 
-    removed.append(messages.pop(ai_index))
     removed.reverse()
     return removed
+
+
+def _pop_oldest_non_protected_message(
+    messages: list[BaseMessage],
+    protected_indexes: set[int],
+) -> BaseMessage | None:
+    for index, _message in enumerate(messages):
+        if index in protected_indexes:
+            continue
+        return messages.pop(index)
+    return None
+
+
+def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
+    important: set[int] = set()
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+
+        text = str(message.content)
+        if not _is_important_tool_output(text):
+            continue
+
+        important.add(index)
+
+        for prev_index in range(index - 1, -1, -1):
+            prev_message = messages[prev_index]
+            if isinstance(prev_message, AIMessage) and getattr(prev_message, "tool_calls", None):
+                important.add(prev_index)
+                break
+            if isinstance(prev_message, ToolMessage):
+                break
+
+    return important
+
+
+def _is_important_tool_output(text: str) -> bool:
+    cmd = (_extract_cmd(text) or "").lower()
+    lowered = text.lower()
+
+    if "ctest" in cmd and "-r" not in cmd:
+        return True
+
+    signal_patterns = [
+        r"\d+% tests passed, \d+ tests failed out of \d+",
+        r"the following tests failed",
+        r"\*\*\*timeout",
+        r"did not throw",
+        r"\bis not correct\b",
+        r"\[exit_code\]=[1-9]\d*",
+    ]
+    for pattern in signal_patterns:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return True
+
+    if "cmake --build" in cmd and "[exit_code]=0" in lowered:
+        return True
+
+    return False
 
 
 def _reasoner_output_budget(config: AgentConfig) -> int:
