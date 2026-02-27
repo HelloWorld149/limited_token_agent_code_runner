@@ -14,7 +14,7 @@ Rules:
 4) Keep reasoning concise and action-oriented.
 5) Stop when you have enough evidence and provide final conclusions.
 6) On Windows, use Windows-safe executable paths:
-	- prefer `build\\tests\\name.exe` (not `build/tests/name.exe`)
+	- prefer `build\\tests\\name.exe` 
 	- do not prefix executables with `./`
 """.strip()
 
