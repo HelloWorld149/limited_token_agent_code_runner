@@ -12,6 +12,7 @@ class AgentConfig:
     prune_threshold: int = int(os.getenv("AGENT_PRUNE_THRESHOLD", "4000"))
     output_token_budget: int = int(os.getenv("AGENT_OUTPUT_TOKENS", "1000"))
     input_token_budget: int = int(os.getenv("AGENT_INPUT_TOKENS", "4000"))
+    failure_retry_limit: int = int(os.getenv("AGENT_FAILURE_RETRY_LIMIT", "2"))
     repo_dir: Path = Path(os.getenv("AGENT_REPO_DIR", "workspace"))
     clone_url: str = "https://github.com/nlohmann/json"
 

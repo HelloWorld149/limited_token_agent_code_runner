@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -70,6 +71,10 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     )
 
     response = model.invoke(messages_for_model)
+
+    if _should_force_failure_retry(state, response, config):
+        response = _build_forced_retry_tool_call(state)
+
     return {
         "messages": [response],
         "step_count": state["step_count"] + 1,
@@ -435,6 +440,38 @@ def _build_chat_model(model_name: str, max_tokens: int) -> ChatOpenAI:
 def _is_codex_or_gpt5_model(model_name: str) -> bool:
     lowered = model_name.lower()
     return "codex" in lowered or lowered.startswith("gpt-5")
+
+
+def _should_force_failure_retry(state: AgentState, response: AIMessage, config: AgentConfig) -> bool:
+    has_tool_call = bool(getattr(response, "tool_calls", None))
+    if has_tool_call:
+        return False
+    if state.get("status") != "FAILED":
+        return False
+    if state.get("step_count", 0) >= config.max_steps - 1:
+        return False
+    if state.get("consecutive_errors", 0) >= config.failure_retry_limit:
+        return False
+    return True
+
+
+def _build_forced_retry_tool_call(state: AgentState) -> AIMessage:
+    if state.get("consecutive_errors", 0) == 0:
+        cmd = "ctest --test-dir build --output-on-failure -j1"
+    else:
+        cmd = "ctest --test-dir build -R \"fetch_content|regression1|testsuites|class_parser\" --output-on-failure -V"
+
+    return AIMessage(
+        content="Auto-retry policy: failure detected, running one more diagnostic command before finalizing.",
+        tool_calls=[
+            {
+                "name": "execute_shell_command",
+                "args": {"cmd": cmd},
+                "id": f"forced_retry_{uuid4().hex[:10]}",
+                "type": "tool_call",
+            }
+        ],
+    )
 
 
 def _collect_environment_facts(config: AgentConfig) -> str:
