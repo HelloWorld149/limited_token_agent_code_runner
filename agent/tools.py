@@ -65,21 +65,12 @@ def _safe_relative(path: Path, root: Path) -> str:
 def execute_shell_command(cmd: str) -> str:
     """Run a shell command and capture both stdout and stderr with truncation logic."""
     normalized_cmd = _normalize_command_for_platform(cmd)
-    try:
-        completed = subprocess.run(
-            normalized_cmd,
-            shell=True,
-            text=True,
-            capture_output=True,
-            timeout=300,  # 5 minute timeout
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            f"[cmd]={normalized_cmd}\n"
-            f"[exit_code]=124\n"
-            f"[stdout]\n<command timed out after 300 seconds>\n"
-            f"[stderr]\n<timeout>"
-        )
+    completed = subprocess.run(
+        normalized_cmd,
+        shell=True,
+        text=True,
+        capture_output=True,
+    )
     combined = (
         f"[cmd]={normalized_cmd}\n"
         f"[exit_code]={completed.returncode}\n"

@@ -151,7 +151,7 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     system = SystemMessage(content=REASONER_SYSTEM_PROMPT)
     summary_context = HumanMessage(content=f"Knowledge summary: {state['summary_of_knowledge']}")
     history = list(state["messages"])
-    stagnation_hint = _build_stagnation_hint(history)
+    stagnation_hint = _build_stagnation_hint(state, history)
     messages_for_model = _fit_reasoner_messages_to_budget(
         system=system,
         summary_context=summary_context,
@@ -164,9 +164,19 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     response = model.invoke(messages_for_model)
 
-    # --- Forced retry: override if LLM gives up prematurely on FAILED status ---
-    if _should_force_failure_retry(state, config, response):
-        response = _build_forced_retry_response(state)
+    # Reflective retry: if the model stops on FAILED status, ask it to reconsider with evidence.
+    if _should_reflect_on_failure(state, config, response):
+        reflection_hint = HumanMessage(content=_build_failure_reflection_hint(state))
+        reflected_messages = [*messages_for_model, response, reflection_hint]
+        reflected_messages = _fit_messages_to_budget(
+            reflected_messages,
+            model_name=config.model_name,
+            input_budget=config.input_token_budget,
+        )
+        reflected_messages = _sanitize_tool_message_sequence(reflected_messages)
+        reflected_response = model.invoke(reflected_messages)
+        if getattr(reflected_response, "tool_calls", None):
+            response = reflected_response
 
     return {
         "messages": [response],
@@ -174,45 +184,60 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     }
 
 
-def _should_force_failure_retry(state: AgentState, config: AgentConfig, response: AIMessage) -> bool:
-    """Check if we should override the LLM's decision to stop and force a diagnostic retry."""
-    # If LLM already wants to call tools, let it proceed
+def _should_reflect_on_failure(state: AgentState, config: AgentConfig, response: AIMessage) -> bool:
+    """If the model tries to stop after failure, trigger one reflective re-reasoning pass."""
     if getattr(response, "tool_calls", None):
         return False
-    # Only force retry when status indicates failure
+
     if state["status"] not in ("FAILED",):
         return False
-    # Don't retry if we're out of steps (need at least 2: one for retry, one for report)
+
     if state["step_count"] >= config.max_steps - 2:
         return False
-    # Don't retry if we're stuck in a loop
+
     if state.get("consecutive_errors", 0) >= config.failure_retry_limit:
         return False
+
     return True
 
 
-def _build_forced_retry_response(state: AgentState) -> AIMessage:
-    """Build a forced diagnostic tool call when the LLM gives up prematurely."""
-    consecutive = state.get("consecutive_errors", 0)
+def _build_failure_reflection_hint(state: AgentState) -> str:
+    last_tool = _last_tool_message(state.get("messages", []))
+    last_cmd = _extract_cmd(str(last_tool.content)) if last_tool is not None else None
+    last_error = _extract_error_signature(last_tool.content) if last_tool is not None else None
 
-    if consecutive == 0:
-        # First retry: re-run full test suite with verbose output
-        cmd = "ctest --test-dir build --output-on-failure -j1"
-    elif consecutive == 1:
-        # Second retry: try rebuilding with cmake --build
-        cmd = "cmake --build build"
-    else:
-        # Subsequent retries: list tests without running to get diagnostics
-        cmd = "ctest --test-dir build --output-on-failure -N"
-
-    return AIMessage(
-        content=f"Forcing diagnostic retry (consecutive_errors={consecutive}) before giving up.",
-        tool_calls=[{
-            "id": f"forced_retry_{state['step_count']}",
-            "name": "execute_shell_command",
-            "args": {"cmd": cmd},
-        }],
+    parts = [
+        "You attempted to stop while status is FAILED.",
+        "Re-evaluate the latest evidence and propose a different next action.",
+        "Do not repeat identical discovery calls unless they add new evidence.",
+    ]
+    if last_cmd:
+        parts.append(f"Last command: {last_cmd}")
+    if last_error:
+        parts.append(f"Last error signal: {last_error}")
+    parts.append(
+        "Choose the next tool call that most directly reduces uncertainty or addresses the failure root cause."
     )
+    return " ".join(parts)
+
+
+def _last_tool_message(messages: list[BaseMessage]) -> ToolMessage | None:
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage):
+            return message
+    return None
+
+
+def _fit_messages_to_budget(
+    messages: list[BaseMessage],
+    model_name: str,
+    input_budget: int,
+) -> list[BaseMessage]:
+    current_messages = list(messages)
+    while estimate_token_count(current_messages, model_name) > input_budget and len(current_messages) > 2:
+        if not _pop_oldest_tool_observation_pair(current_messages):
+            current_messages.pop(0)
+    return current_messages
 
 
 def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
@@ -331,9 +356,9 @@ def _summarize_messages(messages: list[BaseMessage]) -> str:
             if build_summary:
                 findings.append(build_summary)
 
-        error_line = _first_matching_line(text, r".*\b(error|failed|fatal)\b.*")
-        if error_line:
-            errors.append(error_line[:160])
+        tool_error = _extract_error_signature(text)
+        if tool_error:
+            errors.append(tool_error[:160])
 
         file_line = _first_matching_line(text, r"[\w\-./\\]+\.(cpp|cc|cxx|h|hpp|cmake|txt):\d+")
         if file_line:
@@ -384,10 +409,27 @@ def _compute_consecutive_errors(state: AgentState) -> int:
 
 def _extract_error_signature(text: Any) -> str | None:
     content = str(text)
-    lines = content.splitlines()
-    for line in lines:
-        if re.search(r"error|failed|fatal", line, flags=re.IGNORECASE):
-            return line.strip()[:200]
+
+    # Treat structured command output as authoritative for errors.
+    if "[cmd]=" in content and "[exit_code]=" in content:
+        cmd = (_extract_cmd(content) or "").strip()
+        code = _extract_exit_code(content)
+        if code is not None and code != 0:
+            line = _first_matching_line(content, r".*\b(error|failed|fatal)\b.*")
+            if line:
+                return f"{cmd}: {line}"[:200]
+            return f"{cmd}: non-zero exit code {code}"[:200]
+        return None
+
+    # For non-shell tool outputs, only count explicit tool validation failures.
+    validation_error = _first_matching_line(
+        content,
+        r"line range too large|invalid line range|invalid regex|invalid file|invalid directory|depth too large",
+    )
+    if validation_error:
+        return validation_error[:200]
+
+    # Ignore incidental words like 'error' found in search results/changelog lines.
     return None
 
 
@@ -609,10 +651,10 @@ def _recent_tool_context_indexes(messages: list[BaseMessage], keep_pairs: int = 
     return protected
 
 
-def _build_stagnation_hint(history: list[BaseMessage]) -> HumanMessage | None:
+def _build_stagnation_hint(state: AgentState, history: list[BaseMessage]) -> HumanMessage | None:
     signatures = _recent_tool_call_signatures(history, window=4)
     if len(signatures) < 3:
-        return None
+        signatures = signatures
 
     # If the same tool-call signature repeats across recent turns, nudge strategy change.
     if len(set(signatures[-3:])) == 1:
@@ -625,6 +667,47 @@ def _build_stagnation_hint(history: list[BaseMessage]) -> HumanMessage | None:
                 "Prefer the next unresolved lifecycle step (configure/build/test or failure diagnosis)."
             )
         )
+
+    recent_patterns = _recent_tool_name_patterns(history, window=5)
+    if recent_patterns and all("execute_shell_command" not in pattern for pattern in recent_patterns):
+        return HumanMessage(
+            content=(
+                "Stagnation detected: multiple turns used discovery/search tools only and no real command execution. "
+                "Pick a concrete next experiment using execute_shell_command based on current evidence, "
+                "then use its output to update strategy."
+            )
+        )
+
+    # Progress-aware guard: if several shell commands ran but none advanced lifecycle, force pivot.
+    recent_shell_cmds = _recent_shell_commands(history, window=8)
+    if state.get("step_count", 0) >= 3 and recent_shell_cmds:
+        has_lifecycle_cmd = any(_is_lifecycle_command(cmd) for cmd in recent_shell_cmds)
+        if not has_lifecycle_cmd:
+            cmds = " ; ".join(recent_shell_cmds[-4:])
+            return HumanMessage(
+                content=(
+                    "Stagnation detected: recent shell commands did not perform configure/build/test actions. "
+                    f"Recent shell commands: {cmds}. "
+                    "Choose one command that advances lifecycle (configure, build, or test) based on detected build files and tools. "
+                    "Avoid repository metadata commands unless they directly help diagnose a failure."
+                )
+            )
+
+    # If tool usage stays discovery-heavy for too long, request a lifecycle action.
+    if state.get("step_count", 0) >= 6 and recent_patterns:
+        discovery_only = True
+        for pattern in recent_patterns[-4:]:
+            names = [n for n in pattern.split("|") if n]
+            if any(name not in {"list_directory", "search_codebase", "read_file_chunk"} for name in names):
+                discovery_only = False
+                break
+        if discovery_only:
+            return HumanMessage(
+                content=(
+                    "Stagnation detected: last turns were discovery-only. "
+                    "Use current evidence to run a concrete build-system command and evaluate its output."
+                )
+            )
 
     return None
 
@@ -649,6 +732,48 @@ def _recent_tool_call_signatures(history: list[BaseMessage], window: int = 4) ->
     if window <= 0:
         return signatures
     return signatures[-window:]
+
+
+def _recent_tool_name_patterns(history: list[BaseMessage], window: int = 5) -> list[str]:
+    patterns: list[str] = []
+    for message in history:
+        if not isinstance(message, AIMessage):
+            continue
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            continue
+        names = sorted(str(call.get("name", "")) for call in tool_calls)
+        patterns.append("|".join(names))
+    if window <= 0:
+        return patterns
+    return patterns[-window:]
+
+
+def _recent_shell_commands(history: list[BaseMessage], window: int = 8) -> list[str]:
+    cmds: list[str] = []
+    for message in history:
+        if not isinstance(message, ToolMessage):
+            continue
+        text = str(message.content)
+        cmd = _extract_cmd(text)
+        if cmd:
+            cmds.append(cmd)
+    if window <= 0:
+        return cmds
+    return cmds[-window:]
+
+
+def _is_lifecycle_command(cmd: str) -> bool:
+    lowered = cmd.lower()
+    patterns = [
+        r"\bcmake\b.*\b(-b|-s|--build)\b",
+        r"\bctest\b",
+        r"\bninja\b",
+        r"\bmingw32-make\b",
+        r"\bmake\b",
+        r"\bmeson\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
 
 
 def _is_important_tool_output(text: str) -> bool:
