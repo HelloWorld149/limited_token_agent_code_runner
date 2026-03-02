@@ -162,7 +162,21 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     )
     messages_for_model = _sanitize_tool_message_sequence(messages_for_model)
 
-    response = model.invoke(messages_for_model)
+    try:
+        response = model.invoke(messages_for_model)
+    except Exception as exc:
+        fallback = AIMessage(
+            content=(
+                "LLM invocation failed in agent_reasoner. "
+                f"Error: {type(exc).__name__}: {str(exc)[:220]}. "
+                "Stopping tool loop and routing to final report generation."
+            )
+        )
+        return {
+            "messages": [fallback],
+            "step_count": state["step_count"] + 1,
+            "status": "FAILED",
+        }
 
     # Reflective retry: if the model stops on FAILED status, ask it to reconsider with evidence.
     if _should_reflect_on_failure(state, config, response):
@@ -174,7 +188,10 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             input_budget=config.input_token_budget,
         )
         reflected_messages = _sanitize_tool_message_sequence(reflected_messages)
-        reflected_response = model.invoke(reflected_messages)
+        try:
+            reflected_response = model.invoke(reflected_messages)
+        except Exception:
+            reflected_response = response
         if getattr(reflected_response, "tool_calls", None):
             response = reflected_response
 
@@ -305,8 +322,32 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         input_budget=config.input_token_budget,
     )
     report_messages = _sanitize_tool_message_sequence(report_messages)
-    response = model.invoke(report_messages)
+    try:
+        response = model.invoke(report_messages)
+    except Exception as exc:
+        response = AIMessage(
+            content=_build_local_fallback_report(state, config, exc)
+        )
     return {"messages": [response]}
+
+
+def _build_local_fallback_report(state: AgentState, config: AgentConfig, error: Exception) -> str:
+    environment_facts = _collect_environment_facts(config)
+    command_evidence = _build_command_evidence_snapshot(state)
+    return (
+        "## Final Build/Test Report (Local Fallback)\n\n"
+        "LLM report generation failed due to a connection/runtime error, so this summary is generated locally.\n\n"
+        f"- LLM error: {type(error).__name__}: {str(error)[:300]}\n"
+        f"- Status: {state.get('status')}\n"
+        f"- Step count: {state.get('step_count')}\n"
+        f"- Consecutive errors: {state.get('consecutive_errors')}\n\n"
+        "### Environment Facts\n"
+        f"{environment_facts}\n\n"
+        "### Command Evidence\n"
+        f"{command_evidence}\n\n"
+        "### Knowledge Summary\n"
+        f"{state.get('summary_of_knowledge', '')[:2000]}"
+    )
 
 
 def route_from_reasoner(state: AgentState, config: AgentConfig) -> str:
