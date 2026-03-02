@@ -1,39 +1,30 @@
 from __future__ import annotations
 
 from typing import Iterable
+
+import tiktoken
 from langchain_core.messages import BaseMessage
 
-try:
-    import tiktoken
-except Exception:  # pragma: no cover
-    tiktoken = None
+
+def _get_encoder(model_name: str) -> tiktoken.Encoding:
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
 
 
 def estimate_token_count(messages: Iterable[BaseMessage], model_name: str) -> int:
-    if tiktoken is not None:
-        try:
-            encoder = tiktoken.encoding_for_model(model_name)
-        except Exception:
-            encoder = tiktoken.get_encoding("cl100k_base")
-
-        total = 0
-        for message in messages:
-            content = _message_text(message)
-            total += len(encoder.encode(content)) + 4
-        return total
-
-    total_chars = sum(len(_message_text(message)) for message in messages)
-    return total_chars // 4
+    encoder = _get_encoder(model_name)
+    total = 0
+    for message in messages:
+        content = _message_text(message)
+        total += len(encoder.encode(content)) + 4
+    return total
 
 
 def estimate_text_tokens(text: str, model_name: str) -> int:
-    if tiktoken is not None:
-        try:
-            encoder = tiktoken.encoding_for_model(model_name)
-        except Exception:
-            encoder = tiktoken.get_encoding("cl100k_base")
-        return len(encoder.encode(text))
-    return len(text) // 4
+    encoder = _get_encoder(model_name)
+    return len(encoder.encode(text))
 
 
 def trim_text_to_token_budget(text: str, model_name: str, max_tokens: int) -> str:

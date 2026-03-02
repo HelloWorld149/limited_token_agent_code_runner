@@ -6,7 +6,6 @@ import os
 @dataclass(frozen=True)
 class AgentConfig:
     model_name: str = os.getenv("AGENT_MODEL", "gpt-5.3-codex")
-    fallback_chat_model: str = os.getenv("AGENT_FALLBACK_CHAT_MODEL", "gpt-4o-mini")
     max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "15"))
     token_budget: int = int(os.getenv("AGENT_TOKEN_BUDGET", "5000"))
     prune_threshold: int = int(os.getenv("AGENT_PRUNE_THRESHOLD", "4000"))

@@ -24,7 +24,7 @@ def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, An
     if repo_path.exists() and (repo_path / ".git").exists():
         summary = "Workspace already initialized; repository folder exists at workspace/json."
     else:
-        clone_cmd = "git clone https://github.com/nlohmann/json"
+        clone_cmd = f"git clone {config.clone_url}"
         result = subprocess.run(clone_cmd, text=True, capture_output=True, shell=True, cwd=str(repo_parent))
         if result.returncode != 0 and "already exists" not in (result.stderr or ""):
             summary = (
