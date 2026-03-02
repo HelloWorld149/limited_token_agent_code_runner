@@ -5,7 +5,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 
-Status = Literal["EXPLORING", "BUILDING", "TESTING", "FAILED", "SUCCESS"]
+Status = Literal["EXPLORING", "CONFIGURING", "BUILDING", "TESTING", "FAILED", "SUCCESS"]
 
 
 class AgentState(TypedDict):

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 from pathlib import Path
 import re
 import subprocess
 from typing import Any
-from uuid import uuid4
+from urllib.parse import urlparse
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -16,13 +18,21 @@ from agent.state import AgentState
 from agent.token_utils import estimate_token_count, trim_text_to_token_budget
 
 
+def _repo_name_from_url(url: str) -> str:
+    """Extract the repository name from a git clone URL."""
+    path = urlparse(url).path
+    name = Path(path).stem
+    return name or "repo"
+
+
 def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     repo_parent = config.repo_dir
     repo_parent.mkdir(parents=True, exist_ok=True)
-    repo_path = repo_parent / "json"
+    repo_name = _repo_name_from_url(config.clone_url)
+    repo_path = repo_parent / repo_name
 
     if repo_path.exists() and (repo_path / ".git").exists():
-        summary = "Workspace already initialized; repository folder exists at workspace/json."
+        summary = f"Workspace already initialized; repository folder exists at {repo_path}."
     else:
         clone_cmd = f"git clone {config.clone_url}"
         result = subprocess.run(clone_cmd, text=True, capture_output=True, shell=True, cwd=str(repo_parent))
@@ -32,15 +42,21 @@ def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, An
                 f"stderr: {(result.stderr or '').strip()[:300]}"
             )
         else:
-            summary = "Workspace initialized and repository cloned into workspace/json."
+            summary = f"Workspace initialized and repository cloned into {repo_path}."
 
     if repo_path.exists() and repo_path.is_dir():
         os.chdir(repo_path)
         summary = _merge_summary(summary, f"Working directory set to {repo_path}.")
 
+    # --- Environment Detection Phase ---
+    env_facts = _probe_environment(repo_path)
+    summary = _merge_summary(summary, "Environment: " + " | ".join(env_facts))
+
     message = HumanMessage(
         content=(
-            "Start exploring and building the cloned nlohmann/json repository. "
+            "Start exploring and building the cloned repository. "
+            "First discover the project structure and build system, then build and run tests. "
+            "Read the environment facts in the knowledge summary and adapt your build commands accordingly. "
             "Use tools iteratively and stop with a clear final report."
         )
     )
@@ -50,6 +66,79 @@ def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, An
         "summary_of_knowledge": _merge_summary(state.get("summary_of_knowledge", ""), summary),
         "status": "EXPLORING",
     }
+
+
+def _probe_environment(repo_path: Path) -> list[str]:
+    """Detect OS, available build tools, recommended cmake generator, and fix common issues."""
+    env_facts: list[str] = []
+
+    # 1. OS detection
+    env_facts.append(f"os={platform.system()}")
+    env_facts.append(f"os_name={os.name}")
+
+    # 2. Clean stale build directory to avoid cmake cache conflicts
+    build_dir = repo_path / "build"
+    if build_dir.exists():
+        try:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            env_facts.append("stale_build_dir=cleaned")
+        except Exception:
+            env_facts.append("stale_build_dir=cleanup_failed")
+
+    # 3. Windows long paths — enable automatically
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                "git config core.longpaths true",
+                shell=True, capture_output=True, text=True, timeout=5,
+                cwd=str(repo_path),
+            )
+            env_facts.append("git_longpaths=enabled")
+        except Exception:
+            env_facts.append("git_longpaths=failed_to_enable")
+
+    # 4. Detect available tools
+    tool_checks = [
+        ("cmake --version", "cmake"),
+        ("g++ --version", "gxx"),
+        ("cl", "msvc"),
+        ("ninja --version", "ninja"),
+        ("mingw32-make --version", "mingw32_make"),
+        ("make --version", "make"),
+    ]
+    for cmd, label in tool_checks:
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            available = result.returncode == 0
+            first_line = (result.stdout or result.stderr or "").strip().split("\n")[0][:100]
+            env_facts.append(f"{label}={'yes: ' + first_line if available else 'not found'}")
+        except Exception:
+            env_facts.append(f"{label}=check_failed")
+
+    # 5. Detect best cmake generator
+    if os.name == "nt":
+        if shutil.which("ninja"):
+            env_facts.append("recommended_generator=Ninja")
+        elif shutil.which("mingw32-make"):
+            env_facts.append("recommended_generator=MinGW Makefiles")
+        elif shutil.which("cl"):
+            env_facts.append("recommended_generator=default (Visual Studio)")
+        else:
+            env_facts.append("recommended_generator=unknown (no build tool found)")
+    else:
+        if shutil.which("ninja"):
+            env_facts.append("recommended_generator=Ninja")
+        else:
+            env_facts.append("recommended_generator=default (Unix Makefiles)")
+
+    # 6. Path length risk assessment (Windows 260 char limit)
+    path_len = len(str(repo_path.resolve()))
+    if path_len > 120:
+        env_facts.append(f"path_length_risk=high ({path_len} chars)")
+    else:
+        env_facts.append(f"path_length_risk=low ({path_len} chars)")
+
+    return env_facts
 
 
 def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
@@ -62,24 +151,68 @@ def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     system = SystemMessage(content=REASONER_SYSTEM_PROMPT)
     summary_context = HumanMessage(content=f"Knowledge summary: {state['summary_of_knowledge']}")
     history = list(state["messages"])
+    stagnation_hint = _build_stagnation_hint(history)
     messages_for_model = _fit_reasoner_messages_to_budget(
         system=system,
         summary_context=summary_context,
         history=history,
         model_name=config.model_name,
         input_budget=config.input_token_budget,
+        stagnation_hint=stagnation_hint,
     )
     messages_for_model = _sanitize_tool_message_sequence(messages_for_model)
 
     response = model.invoke(messages_for_model)
 
-    if _should_force_failure_retry(state, response, config):
-        response = _build_forced_retry_tool_call(state)
+    # --- Forced retry: override if LLM gives up prematurely on FAILED status ---
+    if _should_force_failure_retry(state, config, response):
+        response = _build_forced_retry_response(state)
 
     return {
         "messages": [response],
         "step_count": state["step_count"] + 1,
     }
+
+
+def _should_force_failure_retry(state: AgentState, config: AgentConfig, response: AIMessage) -> bool:
+    """Check if we should override the LLM's decision to stop and force a diagnostic retry."""
+    # If LLM already wants to call tools, let it proceed
+    if getattr(response, "tool_calls", None):
+        return False
+    # Only force retry when status indicates failure
+    if state["status"] not in ("FAILED",):
+        return False
+    # Don't retry if we're out of steps (need at least 2: one for retry, one for report)
+    if state["step_count"] >= config.max_steps - 2:
+        return False
+    # Don't retry if we're stuck in a loop
+    if state.get("consecutive_errors", 0) >= config.failure_retry_limit:
+        return False
+    return True
+
+
+def _build_forced_retry_response(state: AgentState) -> AIMessage:
+    """Build a forced diagnostic tool call when the LLM gives up prematurely."""
+    consecutive = state.get("consecutive_errors", 0)
+
+    if consecutive == 0:
+        # First retry: re-run full test suite with verbose output
+        cmd = "ctest --test-dir build --output-on-failure -j1"
+    elif consecutive == 1:
+        # Second retry: try rebuilding with cmake --build
+        cmd = "cmake --build build"
+    else:
+        # Subsequent retries: list tests without running to get diagnostics
+        cmd = "ctest --test-dir build --output-on-failure -N"
+
+    return AIMessage(
+        content=f"Forcing diagnostic retry (consecutive_errors={consecutive}) before giving up.",
+        tool_calls=[{
+            "id": f"forced_retry_{state['step_count']}",
+            "name": "execute_shell_command",
+            "args": {"cmd": cmd},
+        }],
+    )
 
 
 def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
@@ -127,7 +260,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     model = _build_chat_model(config.model_name, report_output_budget)
     system = SystemMessage(content=REPORT_SYSTEM_PROMPT)
     environment_facts = _collect_environment_facts(config)
-    ctest_snapshot = _build_ctest_evidence_snapshot(state)
+    command_evidence = _build_command_evidence_snapshot(state)
     report_request = HumanMessage(
         content=(
             f"Status: {state['status']}\n"
@@ -135,7 +268,7 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             f"Step count: {state['step_count']}\n"
             f"Knowledge summary: {state['summary_of_knowledge']}\n"
             f"Environment facts:\n{environment_facts}\n"
-            f"CTest evidence snapshot:\n{ctest_snapshot}\n"
+            f"Command evidence:\n{command_evidence}\n"
             "Use recent messages as evidence and produce the final report."
         )
     )
@@ -190,14 +323,13 @@ def _summarize_messages(messages: list[BaseMessage]) -> str:
             if exit_line:
                 findings.append(exit_line)
 
-            if "ctest" in lowered:
+            if "test" in lowered:
                 test_summary = _extract_test_summary(text)
                 if test_summary:
                     findings.append(test_summary)
-            if "cmake --build" in lowered or "ninja" in lowered or "make" in lowered:
-                build_summary = _extract_build_summary(text)
-                if build_summary:
-                    findings.append(build_summary)
+            build_summary = _extract_build_summary(text)
+            if build_summary:
+                findings.append(build_summary)
 
         error_line = _first_matching_line(text, r".*\b(error|failed|fatal)\b.*")
         if error_line:
@@ -272,12 +404,32 @@ def _infer_status(state: AgentState) -> str:
     cmd = (_extract_cmd(last_text) or "").lower()
     exit_code = _extract_exit_code(last_text)
 
-    if "ctest" in cmd:
+    # CTest / test runner detection (most specific first)
+    if re.search(r"\bctest\b", cmd):
         if exit_code == 0:
             return "SUCCESS"
-        return "FAILED"
+        if exit_code is not None:
+            return "FAILED"
+        return "TESTING"
 
-    if "cmake --build" in cmd or "ninja" in cmd or re.search(r"\bmake\b", cmd):
+    # Generic test runner in command
+    if re.search(r"\btest\b", cmd) and not re.search(r"-D\w*test", cmd, re.IGNORECASE):
+        if exit_code == 0:
+            return "SUCCESS"
+        if exit_code is not None:
+            return "FAILED"
+        return "TESTING"
+
+    # cmake configure command (cmake -B build ... without --build)
+    if re.search(r"\bcmake\b", cmd) and not re.search(r"--build", cmd):
+        if exit_code == 0:
+            return "CONFIGURING"
+        if exit_code is not None:
+            return "FAILED"
+        return "CONFIGURING"
+
+    # Build command detection
+    if re.search(r"\bcmake\s+--build\b|\bmake\b|\bninja\b|\bmsbuild\b|\bmingw32-make\b", cmd):
         if exit_code is None:
             return "BUILDING"
         return "FAILED" if exit_code != 0 else "BUILDING"
@@ -294,6 +446,7 @@ def _fit_reasoner_messages_to_budget(
     history: list[BaseMessage],
     model_name: str,
     input_budget: int,
+    stagnation_hint: HumanMessage | None = None,
 ) -> list[BaseMessage]:
     summary_text = str(summary_context.content)
     current_summary = summary_text
@@ -301,7 +454,10 @@ def _fit_reasoner_messages_to_budget(
 
     while True:
         candidate_summary = HumanMessage(content=current_summary)
-        candidate_messages = [system, candidate_summary, *current_history]
+        candidate_messages = [system, candidate_summary]
+        if stagnation_hint is not None:
+            candidate_messages.append(stagnation_hint)
+        candidate_messages.extend(current_history)
         tokens = estimate_token_count(candidate_messages, model_name)
         if tokens <= input_budget:
             return candidate_messages
@@ -319,8 +475,11 @@ def _fit_reasoner_messages_to_budget(
 
         target_summary_tokens = max(64, input_budget // 2)
         current_summary = trim_text_to_token_budget(current_summary, model_name, target_summary_tokens)
-        if estimate_token_count([system, HumanMessage(content=current_summary)], model_name) <= input_budget:
-            return [system, HumanMessage(content=current_summary)]
+        final_messages: list[BaseMessage] = [system, HumanMessage(content=current_summary)]
+        if stagnation_hint is not None:
+            final_messages.append(stagnation_hint)
+        if estimate_token_count(final_messages, model_name) <= input_budget:
+            return final_messages
 
 
 def _fit_report_messages_to_budget(
@@ -403,6 +562,9 @@ def _pop_oldest_non_protected_message(
 def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
     important: set[int] = set()
 
+    # Always protect the most recent tool-call context so the model can react
+    important.update(_recent_tool_context_indexes(messages, keep_pairs=2))
+
     for index, message in enumerate(messages):
         if not isinstance(message, ToolMessage):
             continue
@@ -424,26 +586,95 @@ def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
     return important
 
 
+def _recent_tool_context_indexes(messages: list[BaseMessage], keep_pairs: int = 2) -> set[int]:
+    protected: set[int] = set()
+    remaining = keep_pairs
+
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, AIMessage) or not getattr(msg, "tool_calls", None):
+            continue
+
+        protected.add(index)
+        for j in range(index + 1, len(messages)):
+            if isinstance(messages[j], ToolMessage):
+                protected.add(j)
+            elif isinstance(messages[j], AIMessage):
+                break
+
+        remaining -= 1
+        if remaining <= 0:
+            break
+
+    return protected
+
+
+def _build_stagnation_hint(history: list[BaseMessage]) -> HumanMessage | None:
+    signatures = _recent_tool_call_signatures(history, window=4)
+    if len(signatures) < 3:
+        return None
+
+    # If the same tool-call signature repeats across recent turns, nudge strategy change.
+    if len(set(signatures[-3:])) == 1:
+        repeated = signatures[-1]
+        return HumanMessage(
+            content=(
+                "Stagnation detected: the same tool-call pattern was repeated for 3 consecutive turns "
+                f"({repeated}). Choose a different strategy using new evidence. "
+                "Do not repeat identical discovery calls unless a command failure explicitly requires it. "
+                "Prefer the next unresolved lifecycle step (configure/build/test or failure diagnosis)."
+            )
+        )
+
+    return None
+
+
+def _recent_tool_call_signatures(history: list[BaseMessage], window: int = 4) -> list[str]:
+    signatures: list[str] = []
+    for message in history:
+        if not isinstance(message, AIMessage):
+            continue
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            continue
+
+        parts: list[str] = []
+        for call in tool_calls:
+            name = str(call.get("name", ""))
+            args = call.get("args", {})
+            args_repr = str(args)
+            parts.append(f"{name}:{args_repr}")
+        signatures.append(" | ".join(parts))
+
+    if window <= 0:
+        return signatures
+    return signatures[-window:]
+
+
 def _is_important_tool_output(text: str) -> bool:
     cmd = (_extract_cmd(text) or "").lower()
     lowered = text.lower()
 
-    if "ctest" in cmd and "-r" not in cmd:
+    # Protect any test runner output
+    if re.search(r"\btest\b", cmd):
         return True
 
+    # Protect messages containing test results or failure signals
     signal_patterns = [
-        r"\d+% tests passed, \d+ tests failed out of \d+",
-        r"the following tests failed",
-        r"\*\*\*timeout",
-        r"did not throw",
-        r"\bis not correct\b",
+        r"\d+% tests passed",
+        r"\d+ (?:tests?\s+)?passed",
+        r"\d+ (?:tests?\s+)?failed",
+        r"the following tests? failed",
+        r"\*\*\*(timeout|failed)",
+        r"assertion.*(failed|error)",
         r"\[exit_code\]=[1-9]\d*",
     ]
     for pattern in signal_patterns:
         if re.search(pattern, lowered, flags=re.IGNORECASE):
             return True
 
-    if "cmake --build" in cmd and "[exit_code]=0" in lowered:
+    # Protect successful build outputs
+    if re.search(r"\b(build|compile|make|ninja)\b", cmd) and "[exit_code]=0" in lowered:
         return True
 
     return False
@@ -507,19 +738,24 @@ def _extract_exit_code(text: str) -> int | None:
 
 
 def _extract_test_summary(text: str) -> str | None:
+    # CTest-style: "N% tests passed, M tests failed out of K"
     total_line = _first_matching_line(text, r"\d+% tests passed, \d+ tests failed out of \d+")
     if total_line:
         return total_line
-    pass_line = _first_matching_line(text, r"100% tests passed")
+    # Generic pass/fail summaries
+    pass_line = _first_matching_line(text, r"\d+\s+(?:tests?\s+)?passed")
     if pass_line:
         return pass_line
+    fail_line = _first_matching_line(text, r"\d+\s+(?:tests?\s+)?failed")
+    if fail_line:
+        return fail_line
     return None
 
 
 def _extract_build_summary(text: str) -> str | None:
-    built_targets = len(re.findall(r"Built target ", text))
-    if built_targets > 0:
-        return f"Built targets observed: {built_targets}"
+    markers = len(re.findall(r"Built target |\[\d+/\d+\]", text))
+    if markers > 0:
+        return f"Build steps observed: {markers}"
     return None
 
 
@@ -558,42 +794,11 @@ def _is_codex_or_gpt5_model(model_name: str) -> bool:
     return "codex" in lowered or lowered.startswith("gpt-5")
 
 
-def _should_force_failure_retry(state: AgentState, response: AIMessage, config: AgentConfig) -> bool:
-    has_tool_call = bool(getattr(response, "tool_calls", None))
-    if has_tool_call:
-        return False
-    if state.get("status") != "FAILED":
-        return False
-    if state.get("step_count", 0) >= config.max_steps - 1:
-        return False
-    if state.get("consecutive_errors", 0) >= config.failure_retry_limit:
-        return False
-    return True
-
-
-def _build_forced_retry_tool_call(state: AgentState) -> AIMessage:
-    if state.get("consecutive_errors", 0) == 0:
-        cmd = "ctest --test-dir build --output-on-failure -j1"
-    else:
-        cmd = "ctest --test-dir build -R \"fetch_content|regression1|testsuites|class_parser\" --output-on-failure -V"
-
-    return AIMessage(
-        content="Auto-retry policy: failure detected, running one more diagnostic command before finalizing.",
-        tool_calls=[
-            {
-                "name": "execute_shell_command",
-                "args": {"cmd": cmd},
-                "id": f"forced_retry_{uuid4().hex[:10]}",
-                "type": "tool_call",
-            }
-        ],
-    )
-
-
 def _collect_environment_facts(config: AgentConfig) -> str:
     facts: list[str] = []
     cwd = Path.cwd()
-    repo_path = config.repo_dir / "json"
+    repo_name = _repo_name_from_url(config.clone_url)
+    repo_path = config.repo_dir / repo_name
 
     facts.append(f"cwd={cwd}")
     facts.append(f"cwd_path_length={len(str(cwd))}")
@@ -633,126 +838,30 @@ def _run_quick_command(cmd: str) -> str:
     return first_line[:200]
 
 
-def _build_ctest_evidence_snapshot(state: AgentState) -> str:
+def _build_command_evidence_snapshot(state: AgentState) -> str:
+    """Scan retained tool messages for command outputs and build a structured evidence summary."""
     tool_messages = [msg for msg in state.get("messages", []) if isinstance(msg, ToolMessage)]
-    ctest_records: list[dict[str, Any]] = []
+    records: list[str] = []
 
     for message in tool_messages:
         text = str(message.content)
         cmd = _extract_cmd(text)
-        if not cmd or "ctest" not in cmd.lower():
+        if not cmd:
             continue
 
-        summary = _extract_test_summary(text) or "<no test summary line found>"
-        failures = _extract_failed_tests(text)
-        if not failures:
-            failures = _extract_inline_failed_tests(text)
+        exit_code = _extract_exit_code(text)
+        test_summary = _extract_test_summary(text)
+        error_line = _first_matching_line(text, r".*\b(error|failed|fatal)\b.*")
 
-        ctest_records.append(
-            {
-                "cmd": cmd,
-                "summary": summary,
-                "failures": failures,
-                "is_targeted": bool(re.search(r"(^|\s)-R(\s|=)", cmd)),
-            }
-        )
+        parts = [f"cmd={cmd}"]
+        if exit_code is not None:
+            parts.append(f"exit_code={exit_code}")
+        if test_summary:
+            parts.append(f"test_result={test_summary}")
+        if error_line and (exit_code is None or exit_code != 0):
+            parts.append(f"error={error_line[:160]}")
+        records.append(" | ".join(parts))
 
-    if not ctest_records:
-        return "No ctest command output found in retained messages."
-
-    full_runs = [record for record in ctest_records if not record["is_targeted"]]
-    targeted_runs = [record for record in ctest_records if record["is_targeted"]]
-
-    latest_full = full_runs[-1] if full_runs else None
-    latest_targeted = targeted_runs[-1] if targeted_runs else None
-
-    lines: list[str] = []
-    lines.append(f"ctest_runs_observed={len(ctest_records)}")
-
-    if latest_full:
-        lines.append(f"full_suite_cmd={latest_full['cmd']}")
-        lines.append(f"full_suite_summary={latest_full['summary']}")
-        lines.extend(_format_failure_type_lines("full_suite", latest_full["failures"]))
-    else:
-        lines.append("full_suite_summary=<missing in retained context>")
-
-    if latest_targeted:
-        lines.append(f"targeted_cmd={latest_targeted['cmd']}")
-        lines.append(f"targeted_summary={latest_targeted['summary']}")
-        lines.extend(_format_failure_type_lines("targeted", latest_targeted["failures"]))
-    else:
-        lines.append("targeted_summary=<none observed>")
-
-    if latest_full and latest_targeted:
-        full_names = {entry["name"] for entry in latest_full["failures"]}
-        targeted_names = {entry["name"] for entry in latest_targeted["failures"]}
-        missing_from_targeted = sorted(name for name in full_names if name and name not in targeted_names)
-        extra_in_targeted = sorted(name for name in targeted_names if name and name not in full_names)
-
-        lines.append(f"consistency_missing_from_targeted={missing_from_targeted or ['<none>']}")
-        lines.append(f"consistency_extra_in_targeted={extra_in_targeted or ['<none>']}")
-
-    lines.append("report_rule=prioritize full_suite_* lines over targeted_* lines when totals differ")
-    return "\n".join(lines)
-
-
-def _extract_failed_tests(text: str) -> list[dict[str, str]]:
-    lines = text.splitlines()
-    section_index = None
-    for index, line in enumerate(lines):
-        if "The following tests FAILED" in line:
-            section_index = index
-            break
-
-    if section_index is None:
-        return []
-
-    results: list[dict[str, str]] = []
-    pattern = re.compile(r"^\s*\d+\s*-\s*([^\(]+?)\s*\((Failed|Timeout)\)")
-    for line in lines[section_index + 1 :]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        match = pattern.search(stripped)
-        if not match:
-            if stripped.lower().startswith("errors while running ctest"):
-                break
-            continue
-        results.append({"name": match.group(1).strip(), "type": match.group(2).strip()})
-    return results
-
-
-def _extract_inline_failed_tests(text: str) -> list[dict[str, str]]:
-    results: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    pattern = re.compile(r"Test\s+#?\d+:\s*([\w\-\.]+)\s*\.*\*\*\*(Failed|Timeout)", re.IGNORECASE)
-
-    for line in text.splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        name = match.group(1).strip()
-        failure_type = match.group(2).capitalize()
-        key = (name, failure_type)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append({"name": name, "type": failure_type})
-
-    return results
-
-
-def _format_failure_type_lines(prefix: str, failures: list[dict[str, str]]) -> list[str]:
-    if not failures:
-        return [f"{prefix}_failed_tests=[]", f"{prefix}_failure_type_counts={{}}"]
-
-    names = sorted({entry["name"] for entry in failures if entry.get("name")})
-    counts: dict[str, int] = {}
-    for entry in failures:
-        failure_type = entry.get("type", "Unknown")
-        counts[failure_type] = counts.get(failure_type, 0) + 1
-
-    return [
-        f"{prefix}_failed_tests={names}",
-        f"{prefix}_failure_type_counts={counts}",
-    ]
+    if not records:
+        return "No command output found in retained messages."
+    return "\n".join(records)

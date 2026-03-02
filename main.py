@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 import re
 from typing import Callable
@@ -13,9 +14,10 @@ from agent.graph import build_graph
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Context-constrained build agent")
-    parser.add_argument("--model", default="gpt-5.3-codex", help="LLM model name")
-    parser.add_argument("--max-steps", type=int, default=15, help="Maximum reasoning loops")
-    parser.add_argument("--repo-dir", default="workspace", help="Local workspace directory")
+    parser.add_argument("--model", default=None, help="LLM model name")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning loops")
+    parser.add_argument("--repo-dir", default=None, help="Local workspace directory")
+    parser.add_argument("--clone-url", default=None, help="Git repository URL to clone")
     parser.add_argument("--verbose-loop", action="store_true", help="Print per-loop node updates")
     parser.add_argument("--log-file", default="", help="Optional path to write runtime logs")
     return parser.parse_args()
@@ -124,11 +126,15 @@ def _print_node_update(node_name: str, payload: dict, emit: Callable[[str], None
 def main() -> None:
     load_dotenv()
     args = parse_args()
-    config = AgentConfig(
-        model_name=args.model,
-        max_steps=args.max_steps,
-        repo_dir=Path(args.repo_dir),
-    )
+    config = AgentConfig()
+    if args.model is not None:
+        config = replace(config, model_name=args.model)
+    if args.max_steps is not None:
+        config = replace(config, max_steps=args.max_steps)
+    if args.repo_dir is not None:
+        config = replace(config, repo_dir=Path(args.repo_dir))
+    if args.clone_url is not None:
+        config = replace(config, clone_url=args.clone_url)
     graph = build_graph(config)
     log_path = Path(args.log_file) if args.log_file else None
     log_handle = None
@@ -147,7 +153,7 @@ def main() -> None:
         "messages": [
             HumanMessage(
                 content=(
-                    "Run the full clone/explore/build/test workflow for nlohmann/json "
+                    "Run the full clone/explore/build/test workflow for the repository "
                     "and produce a final report."
                 )
             )
@@ -159,7 +165,7 @@ def main() -> None:
     }
 
     try:
-        recursion_limit = max(50, args.max_steps * 4 + 10)
+        recursion_limit = max(50, config.max_steps * 4 + 10)
         if not args.verbose_loop:
             result = graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
             last_message = result["messages"][-1]
