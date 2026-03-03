@@ -16,6 +16,16 @@ from agent.tools import ALL_TOOLS
 
 
 def build_graph(config: AgentConfig):
+    """Execute function `build_graph`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        Any: Result produced by this routine.
+    """
     graph = StateGraph(AgentState)
 
     graph.add_node("initialize_workspace", lambda state: initialize_workspace(state, config))

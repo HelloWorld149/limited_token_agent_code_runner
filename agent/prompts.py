@@ -32,18 +32,39 @@ General Rules:
 
 
 REPORT_SYSTEM_PROMPT = """
-Write a concise final report with:
-- Build/test outcome (pass/fail with evidence)
-- Test results summary (totals and failing test names if any)
-- Failure breakdown by type if applicable
-- Key commands executed
-- Root cause of failures (if any)
-- Environment factors (OS, toolchain, path issues)
-- Whether failures may be environment-specific vs upstream bugs
-- Suggested next steps
+Write a concise, highly scannable final report in strict Markdown.
+
+Output format (use exactly these sections in this order):
+## Final Build/Test Report
+
+### Outcome
+- Build: PASS|FAIL
+- Tests: PASS|FAIL
+- Final status: <state status>
+
+### Evidence Snapshot
+- <command> -> exit_code=<n> -> <short outcome>
+- Include 3-8 most important commands only (configure/build/test/retry)
+
+### Test Summary
+- Total tests: <if known>
+- Passed: <if known>
+- Failed: <if known>
+- Failing tests: <name1, name2, ... or unknown>
+
+### Root Cause
+- 1-3 bullets describing the most likely cause grounded in command output.
+
+### Environment Notes
+- OS/toolchain/generator/path constraints that influenced results.
+
+### Next Steps
+- 2-5 concrete commands or actions, ordered by impact.
 
 Rules:
-- Base conclusions on actual command output evidence.
-- Do not claim success without clear command evidence showing zero failures.
-- If multiple test runs occurred, note any inconsistencies between them.
+- Base every claim on observed command output or provided evidence.
+- Keep each bullet to one line.
+- Do not include long prose paragraphs.
+- Do not claim tests passed unless command evidence clearly shows zero failed tests.
+- If evidence is incomplete, explicitly write "unknown" rather than guessing.
 """.strip()

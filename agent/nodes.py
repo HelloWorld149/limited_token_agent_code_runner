@@ -26,6 +26,17 @@ def _repo_name_from_url(url: str) -> str:
 
 
 def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Execute function `initialize_workspace`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        dict[str, Any]: Result produced by this routine.
+    """
     repo_parent = config.repo_dir
     repo_parent.mkdir(parents=True, exist_ok=True)
     repo_name = _repo_name_from_url(config.clone_url)
@@ -142,7 +153,32 @@ def _probe_environment(repo_path: Path) -> list[str]:
 
 
 def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Execute function `agent_reasoner`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        dict[str, Any]: Result produced by this routine.
+    """
     from agent.tools import ALL_TOOLS
+
+    force_report, reason = _should_force_report_due_to_stagnation(state, config)
+    if force_report:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "Stopping iterative tool execution due to stagnation. "
+                        f"Reason: {reason}. Proceed to final report using collected evidence."
+                    )
+                )
+            ],
+            "step_count": state["step_count"] + 1,
+        }
 
     reasoner_output_budget = _reasoner_output_budget(config)
 
@@ -219,6 +255,16 @@ def _should_reflect_on_failure(state: AgentState, config: AgentConfig, response:
 
 
 def _build_failure_reflection_hint(state: AgentState) -> str:
+    """Execute function `_build_failure_reflection_hint`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     last_tool = _last_tool_message(state.get("messages", []))
     last_cmd = _extract_cmd(str(last_tool.content)) if last_tool is not None else None
     last_error = _extract_error_signature(last_tool.content) if last_tool is not None else None
@@ -239,6 +285,16 @@ def _build_failure_reflection_hint(state: AgentState) -> str:
 
 
 def _last_tool_message(messages: list[BaseMessage]) -> ToolMessage | None:
+    """Execute function `_last_tool_message`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        ToolMessage | None: Result produced by this routine.
+    """
     for message in reversed(messages):
         if isinstance(message, ToolMessage):
             return message
@@ -250,6 +306,18 @@ def _fit_messages_to_budget(
     model_name: str,
     input_budget: int,
 ) -> list[BaseMessage]:
+    """Execute function `_fit_messages_to_budget`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+        model_name (str): Input value used by this routine.
+        input_budget (int): Input value used by this routine.
+
+    Returns:
+        list[BaseMessage]: Result produced by this routine.
+    """
     current_messages = list(messages)
     while estimate_token_count(current_messages, model_name) > input_budget and len(current_messages) > 2:
         if not _pop_oldest_tool_observation_pair(current_messages):
@@ -258,6 +326,17 @@ def _fit_messages_to_budget(
 
 
 def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Execute function `context_manager`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        dict[str, Any]: Result produced by this routine.
+    """
     messages = list(state["messages"])
     token_count = estimate_token_count(messages, config.model_name)
     dropped: list[BaseMessage] = []
@@ -297,6 +376,17 @@ def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
 
 def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Execute function `generate_report`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        dict[str, Any]: Result produced by this routine.
+    """
     report_output_budget = _report_output_budget(config)
 
     model = _build_chat_model(config.model_name, report_output_budget)
@@ -332,6 +422,18 @@ def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
 
 def _build_local_fallback_report(state: AgentState, config: AgentConfig, error: Exception) -> str:
+    """Execute function `_build_local_fallback_report`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+        error (Exception): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     environment_facts = _collect_environment_facts(config)
     command_evidence = _build_command_evidence_snapshot(state)
     return (
@@ -351,6 +453,17 @@ def _build_local_fallback_report(state: AgentState, config: AgentConfig, error: 
 
 
 def route_from_reasoner(state: AgentState, config: AgentConfig) -> str:
+    """Execute function `route_from_reasoner`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     if state["step_count"] >= config.max_steps:
         return "generate_report"
 
@@ -361,6 +474,16 @@ def route_from_reasoner(state: AgentState, config: AgentConfig) -> str:
 
 
 def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
+    """Execute function `_last_ai_message`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        AIMessage | None: Result produced by this routine.
+    """
     for message in reversed(messages):
         if isinstance(message, AIMessage):
             return message
@@ -368,6 +491,16 @@ def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
 
 
 def _summarize_messages(messages: list[BaseMessage]) -> str:
+    """Execute function `_summarize_messages`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     if not messages:
         return "Pruned context contained no actionable tool details."
 
@@ -421,17 +554,49 @@ def _summarize_messages(messages: list[BaseMessage]) -> str:
 
 
 def _merge_summary(existing: str, update: str) -> str:
+    """Execute function `_merge_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        existing (str): Input value used by this routine.
+        update (str): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     if not existing:
         return update
     return f"{existing} {update}".strip()
 
 
 def _cap_summary(summary: str, config: AgentConfig) -> str:
+    """Execute function `_cap_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        summary (str): Input value used by this routine.
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     max_summary_tokens = max(256, min(1200, config.input_token_budget // 3))
     return trim_text_to_token_budget(summary, config.model_name, max_summary_tokens)
 
 
 def _compute_consecutive_errors(state: AgentState) -> int:
+    """Execute function `_compute_consecutive_errors`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+
+    Returns:
+        int: Result produced by this routine.
+    """
     tool_messages = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
     if not tool_messages:
         return state.get("consecutive_errors", 0)
@@ -449,6 +614,16 @@ def _compute_consecutive_errors(state: AgentState) -> int:
 
 
 def _extract_error_signature(text: Any) -> str | None:
+    """Execute function `_extract_error_signature`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (Any): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     content = str(text)
 
     # Treat structured command output as authoritative for errors.
@@ -475,6 +650,16 @@ def _extract_error_signature(text: Any) -> str | None:
 
 
 def _infer_status(state: AgentState) -> str:
+    """Execute function `_infer_status`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     tool_messages = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
     if not tool_messages:
         return state["status"]
@@ -531,6 +716,21 @@ def _fit_reasoner_messages_to_budget(
     input_budget: int,
     stagnation_hint: HumanMessage | None = None,
 ) -> list[BaseMessage]:
+    """Execute function `_fit_reasoner_messages_to_budget`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        system (SystemMessage): Input value used by this routine.
+        summary_context (HumanMessage): Input value used by this routine.
+        history (list[BaseMessage]): Input value used by this routine.
+        model_name (str): Input value used by this routine.
+        input_budget (int): Input value used by this routine.
+        stagnation_hint (HumanMessage | None): Input value used by this routine.
+
+    Returns:
+        list[BaseMessage]: Result produced by this routine.
+    """
     summary_text = str(summary_context.content)
     current_summary = summary_text
     current_history = list(history)
@@ -572,6 +772,20 @@ def _fit_report_messages_to_budget(
     model_name: str,
     input_budget: int,
 ) -> list[BaseMessage]:
+    """Execute function `_fit_report_messages_to_budget`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        system (SystemMessage): Input value used by this routine.
+        history (list[BaseMessage]): Input value used by this routine.
+        report_request (HumanMessage): Input value used by this routine.
+        model_name (str): Input value used by this routine.
+        input_budget (int): Input value used by this routine.
+
+    Returns:
+        list[BaseMessage]: Result produced by this routine.
+    """
     current_history = list(history)
     while True:
         candidate = [system, *current_history, report_request]
@@ -597,6 +811,17 @@ def _pop_oldest_tool_observation_pair(
     messages: list[BaseMessage],
     protected_indexes: set[int] | None = None,
 ) -> list[BaseMessage]:
+    """Execute function `_pop_oldest_tool_observation_pair`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+        protected_indexes (set[int] | None): Input value used by this routine.
+
+    Returns:
+        list[BaseMessage]: Result produced by this routine.
+    """
     protected = protected_indexes or set()
 
     ai_index = None
@@ -635,6 +860,17 @@ def _pop_oldest_non_protected_message(
     messages: list[BaseMessage],
     protected_indexes: set[int],
 ) -> BaseMessage | None:
+    """Execute function `_pop_oldest_non_protected_message`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+        protected_indexes (set[int]): Input value used by this routine.
+
+    Returns:
+        BaseMessage | None: Result produced by this routine.
+    """
     for index, _message in enumerate(messages):
         if index in protected_indexes:
             continue
@@ -643,6 +879,16 @@ def _pop_oldest_non_protected_message(
 
 
 def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
+    """Execute function `_important_message_indexes`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        set[int]: Result produced by this routine.
+    """
     important: set[int] = set()
 
     # Always protect the most recent tool-call context so the model can react
@@ -670,6 +916,17 @@ def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
 
 
 def _recent_tool_context_indexes(messages: list[BaseMessage], keep_pairs: int = 2) -> set[int]:
+    """Execute function `_recent_tool_context_indexes`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+        keep_pairs (int): Input value used by this routine.
+
+    Returns:
+        set[int]: Result produced by this routine.
+    """
     protected: set[int] = set()
     remaining = keep_pairs
 
@@ -693,6 +950,17 @@ def _recent_tool_context_indexes(messages: list[BaseMessage], keep_pairs: int = 
 
 
 def _build_stagnation_hint(state: AgentState, history: list[BaseMessage]) -> HumanMessage | None:
+    """Execute function `_build_stagnation_hint`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        state (AgentState): Input value used by this routine.
+        history (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        HumanMessage | None: Result produced by this routine.
+    """
     signatures = _recent_tool_call_signatures(history, window=4)
     if len(signatures) < 3:
         signatures = signatures
@@ -754,6 +1022,17 @@ def _build_stagnation_hint(state: AgentState, history: list[BaseMessage]) -> Hum
 
 
 def _recent_tool_call_signatures(history: list[BaseMessage], window: int = 4) -> list[str]:
+    """Execute function `_recent_tool_call_signatures`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        history (list[BaseMessage]): Input value used by this routine.
+        window (int): Input value used by this routine.
+
+    Returns:
+        list[str]: Result produced by this routine.
+    """
     signatures: list[str] = []
     for message in history:
         if not isinstance(message, AIMessage):
@@ -776,6 +1055,17 @@ def _recent_tool_call_signatures(history: list[BaseMessage], window: int = 4) ->
 
 
 def _recent_tool_name_patterns(history: list[BaseMessage], window: int = 5) -> list[str]:
+    """Execute function `_recent_tool_name_patterns`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        history (list[BaseMessage]): Input value used by this routine.
+        window (int): Input value used by this routine.
+
+    Returns:
+        list[str]: Result produced by this routine.
+    """
     patterns: list[str] = []
     for message in history:
         if not isinstance(message, AIMessage):
@@ -791,6 +1081,17 @@ def _recent_tool_name_patterns(history: list[BaseMessage], window: int = 5) -> l
 
 
 def _recent_shell_commands(history: list[BaseMessage], window: int = 8) -> list[str]:
+    """Execute function `_recent_shell_commands`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        history (list[BaseMessage]): Input value used by this routine.
+        window (int): Input value used by this routine.
+
+    Returns:
+        list[str]: Result produced by this routine.
+    """
     cmds: list[str] = []
     for message in history:
         if not isinstance(message, ToolMessage):
@@ -805,6 +1106,16 @@ def _recent_shell_commands(history: list[BaseMessage], window: int = 8) -> list[
 
 
 def _is_lifecycle_command(cmd: str) -> bool:
+    """Execute function `_is_lifecycle_command`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        cmd (str): Input value used by this routine.
+
+    Returns:
+        bool: Result produced by this routine.
+    """
     lowered = cmd.lower()
     patterns = [
         r"\bcmake\b.*\b(-b|-s|--build)\b",
@@ -818,6 +1129,16 @@ def _is_lifecycle_command(cmd: str) -> bool:
 
 
 def _is_important_tool_output(text: str) -> bool:
+    """Execute function `_is_important_tool_output`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        bool: Result produced by this routine.
+    """
     cmd = (_extract_cmd(text) or "").lower()
     lowered = text.lower()
 
@@ -847,6 +1168,16 @@ def _is_important_tool_output(text: str) -> bool:
 
 
 def _sanitize_tool_message_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Execute function `_sanitize_tool_message_sequence`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        messages (list[BaseMessage]): Input value used by this routine.
+
+    Returns:
+        list[BaseMessage]: Result produced by this routine.
+    """
     allowed_call_ids: set[str] = set()
     sanitized: list[BaseMessage] = []
 
@@ -871,14 +1202,45 @@ def _sanitize_tool_message_sequence(messages: list[BaseMessage]) -> list[BaseMes
 
 
 def _reasoner_output_budget(config: AgentConfig) -> int:
+    """Execute function `_reasoner_output_budget`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        int: Result produced by this routine.
+    """
     return max(256, min(700, config.output_token_budget // 2))
 
 
 def _report_output_budget(config: AgentConfig) -> int:
+    """Execute function `_report_output_budget`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        int: Result produced by this routine.
+    """
     return max(512, config.output_token_budget)
 
 
 def _first_matching_line(text: str, pattern: str) -> str | None:
+    """Execute function `_first_matching_line`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+        pattern (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     regex = re.compile(pattern, flags=re.IGNORECASE)
     for line in text.splitlines():
         if regex.search(line):
@@ -887,6 +1249,16 @@ def _first_matching_line(text: str, pattern: str) -> str | None:
 
 
 def _extract_cmd(text: str) -> str | None:
+    """Execute function `_extract_cmd`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     line = _first_matching_line(text, r"\[cmd\]=.+")
     if not line:
         return None
@@ -894,6 +1266,16 @@ def _extract_cmd(text: str) -> str | None:
 
 
 def _extract_exit_code(text: str) -> int | None:
+    """Execute function `_extract_exit_code`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        int | None: Result produced by this routine.
+    """
     line = _first_matching_line(text, r"\[exit_code\]\s*=\s*\d+|\[exit_code\]=\d+")
     if not line:
         return None
@@ -905,6 +1287,16 @@ def _extract_exit_code(text: str) -> int | None:
 
 def _extract_test_summary(text: str) -> str | None:
     # CTest-style: "N% tests passed, M tests failed out of K"
+    """Execute function `_extract_test_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     total_line = _first_matching_line(text, r"\d+% tests passed, \d+ tests failed out of \d+")
     if total_line:
         return total_line
@@ -919,6 +1311,16 @@ def _extract_test_summary(text: str) -> str | None:
 
 
 def _extract_build_summary(text: str) -> str | None:
+    """Execute function `_extract_build_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     markers = len(re.findall(r"Built target |\[\d+/\d+\]", text))
     if markers > 0:
         return f"Build steps observed: {markers}"
@@ -926,6 +1328,16 @@ def _extract_build_summary(text: str) -> str | None:
 
 
 def _unique_keep_order(items: list[str]) -> list[str]:
+    """Execute function `_unique_keep_order`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        items (list[str]): Input value used by this routine.
+
+    Returns:
+        list[str]: Result produced by this routine.
+    """
     seen: set[str] = set()
     ordered: list[str] = []
     for item in items:
@@ -937,6 +1349,17 @@ def _unique_keep_order(items: list[str]) -> list[str]:
 
 
 def _build_chat_model(model_name: str, max_tokens: int) -> ChatOpenAI:
+    """Execute function `_build_chat_model`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        model_name (str): Input value used by this routine.
+        max_tokens (int): Input value used by this routine.
+
+    Returns:
+        ChatOpenAI: Result produced by this routine.
+    """
     kwargs = {
         "model": model_name,
         "temperature": 0,
@@ -956,11 +1379,31 @@ def _build_chat_model(model_name: str, max_tokens: int) -> ChatOpenAI:
 
 
 def _is_codex_or_gpt5_model(model_name: str) -> bool:
+    """Execute function `_is_codex_or_gpt5_model`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        model_name (str): Input value used by this routine.
+
+    Returns:
+        bool: Result produced by this routine.
+    """
     lowered = model_name.lower()
     return "codex" in lowered or lowered.startswith("gpt-5")
 
 
 def _collect_environment_facts(config: AgentConfig) -> str:
+    """Execute function `_collect_environment_facts`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        config (AgentConfig): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     facts: list[str] = []
     cwd = Path.cwd()
     repo_name = _repo_name_from_url(config.clone_url)
@@ -992,6 +1435,16 @@ def _collect_environment_facts(config: AgentConfig) -> str:
 
 
 def _run_quick_command(cmd: str) -> str:
+    """Execute function `_run_quick_command`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        cmd (str): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     try:
         result = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=5)
     except Exception:
@@ -1031,3 +1484,87 @@ def _build_command_evidence_snapshot(state: AgentState) -> str:
     if not records:
         return "No command output found in retained messages."
     return "\n".join(records)
+
+
+def _should_force_report_due_to_stagnation(state: AgentState, config: AgentConfig) -> tuple[bool, str]:
+    """Hard-stop repeated lifecycle loops and route to final report when evidence is no longer improving."""
+    if state.get("step_count", 0) < max(8, config.max_steps // 3):
+        return False, ""
+
+    outcomes = _recent_shell_outcomes(state.get("messages", []), window=14)
+    if len(outcomes) < 6:
+        return False, ""
+
+    # 1) Identical failing ctest signature repeated in recent turns.
+    recent_ctest = [entry for entry in outcomes if re.search(r"\bctest\b", entry[0], flags=re.IGNORECASE)]
+    if len(recent_ctest) >= 3:
+        ctest_signatures = [
+            f"{_normalize_cmd_for_signature(cmd)}|{exit_code}|{(test_summary or '').strip()}"
+            for cmd, exit_code, test_summary in recent_ctest
+        ]
+        if len(set(ctest_signatures[-3:])) == 1:
+            signature = ctest_signatures[-1]
+            return True, f"same ctest outcome repeated 3 times ({signature[:180]})"
+
+    # 2) Lifecycle command pattern repeats with low diversity and no success transition.
+    lifecycle = [entry for entry in outcomes if _is_lifecycle_command(entry[0])]
+    if len(lifecycle) >= 8:
+        recent = lifecycle[-8:]
+        recent_cmds = [_normalize_cmd_for_signature(cmd) for cmd, _code, _summary in recent]
+        unique_cmds = set(recent_cmds)
+        has_test_execution = any(re.search(r"\bctest\b", cmd, flags=re.IGNORECASE) for cmd in recent_cmds)
+        nonzero_count = sum(1 for _cmd, code, _summary in recent if code not in (None, 0))
+
+        if has_test_execution and len(unique_cmds) <= 3 and nonzero_count >= 3:
+            return True, (
+                "repeated configure/build/test pattern with recurring non-zero exits "
+                f"(unique_recent_lifecycle_cmds={len(unique_cmds)}, failures={nonzero_count})"
+            )
+
+    return False, ""
+
+
+def _recent_shell_outcomes(history: list[BaseMessage], window: int = 14) -> list[tuple[str, int | None, str | None]]:
+    """Execute function `_recent_shell_outcomes`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        history (list[BaseMessage]): Input value used by this routine.
+        window (int): Input value used by this routine.
+
+    Returns:
+        list[tuple[str, int | None, str | None]]: Result produced by this routine.
+    """
+    outcomes: list[tuple[str, int | None, str | None]] = []
+    for message in history:
+        if not isinstance(message, ToolMessage):
+            continue
+        text = str(message.content)
+        cmd = _extract_cmd(text)
+        if not cmd:
+            continue
+        exit_code = _extract_exit_code(text)
+        test_summary = _extract_test_summary(text)
+        outcomes.append((cmd, exit_code, test_summary))
+
+    if window <= 0:
+        return outcomes
+    return outcomes[-window:]
+
+
+def _normalize_cmd_for_signature(cmd: str) -> str:
+    """Execute function `_normalize_cmd_for_signature`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        cmd (str): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
+    normalized = re.sub(r"\s+", " ", cmd.strip().lower())
+    normalized = normalized.replace(".\\build", "build")
+    normalized = normalized.replace("--test-dir .\\build", "--test-dir build")
+    return normalized

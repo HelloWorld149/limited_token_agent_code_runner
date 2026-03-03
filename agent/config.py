@@ -20,6 +20,13 @@ class AgentConfig:
     clone_url: str = field(default_factory=lambda: os.getenv("AGENT_CLONE_URL", "https://github.com/nlohmann/json"))
 
     def __post_init__(self) -> None:
+        """Execute method `__post_init__` on `AgentConfig`.
+
+        This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+        Returns:
+            None: Result produced by this routine.
+        """
         if self.max_steps > 50:
             raise ValueError("max_steps must be <= 50")
         if self.input_token_budget + self.output_token_budget > self.token_budget:
@@ -31,4 +38,11 @@ class AgentConfig:
 
     @property
     def _report_output_budget(self) -> int:
+        """Execute method `_report_output_budget` on `AgentConfig`.
+
+        This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+        Returns:
+            int: Result produced by this routine.
+        """
         return min(self.output_token_budget, max(512, self.output_token_budget))

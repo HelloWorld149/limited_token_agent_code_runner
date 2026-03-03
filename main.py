@@ -13,6 +13,13 @@ from agent.graph import build_graph
 
 
 def parse_args() -> argparse.Namespace:
+    """Execute function `parse_args`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Returns:
+        argparse.Namespace: Result produced by this routine.
+    """
     parser = argparse.ArgumentParser(description="Context-constrained build agent")
     parser.add_argument("--model", default=None, help="LLM model name")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning loops")
@@ -24,22 +31,63 @@ def parse_args() -> argparse.Namespace:
 
 
 def _truncate_text(value: str, max_chars: int = 1000) -> str:
+    """Execute function `_truncate_text`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        value (str): Input value used by this routine.
+        max_chars (int): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 24] + "\n... <truncated for display>"
 
 
 def _format_message_excerpt(message_obj: object) -> str:
+    """Execute function `_format_message_excerpt`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        message_obj (object): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     content = str(getattr(message_obj, "content", ""))
     return _truncate_text(content.strip() or "<empty>", max_chars=900)
 
 
 def _extract_cmd(text: str) -> str | None:
+    """Execute function `_extract_cmd`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     match = re.search(r"^\[cmd\]=(.*)$", text, flags=re.MULTILINE)
     return match.group(1).strip() if match else None
 
 
 def _extract_exit_code(text: str) -> int | None:
+    """Execute function `_extract_exit_code`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        int | None: Result produced by this routine.
+    """
     match = re.search(r"\[exit_code\]\s*=\s*(\d+)|\[exit_code\]=(\d+)", text)
     if not match:
         return None
@@ -48,6 +96,16 @@ def _extract_exit_code(text: str) -> int | None:
 
 
 def _extract_first_error_line(text: str) -> str | None:
+    """Execute function `_extract_first_error_line`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     for line in text.splitlines():
         if re.search(r"\berror\b|\bfatal\b|\bfailed\b", line, flags=re.IGNORECASE):
             return line.strip()
@@ -55,6 +113,16 @@ def _extract_first_error_line(text: str) -> str | None:
 
 
 def _extract_test_summary(text: str) -> str | None:
+    """Execute function `_extract_test_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     match = re.search(r"\d+% tests passed, \d+ tests failed out of \d+", text, flags=re.IGNORECASE)
     if match:
         return match.group(0)
@@ -64,6 +132,16 @@ def _extract_test_summary(text: str) -> str | None:
 
 
 def _extract_build_summary(text: str) -> str | None:
+    """Execute function `_extract_build_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+
+    Returns:
+        str | None: Result produced by this routine.
+    """
     count = len(re.findall(r"Built target ", text))
     if count > 0:
         return f"Built targets observed: {count}"
@@ -71,6 +149,17 @@ def _extract_build_summary(text: str) -> str | None:
 
 
 def _print_tool_result_summary(text: str, emit: Callable[[str], None]) -> None:
+    """Execute function `_print_tool_result_summary`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        text (str): Input value used by this routine.
+        emit (Callable[[str], None]): Input value used by this routine.
+
+    Returns:
+        None: Result produced by this routine.
+    """
     cmd = _extract_cmd(text)
     exit_code = _extract_exit_code(text)
     test_summary = _extract_test_summary(text)
@@ -90,6 +179,18 @@ def _print_tool_result_summary(text: str, emit: Callable[[str], None]) -> None:
 
 
 def _print_node_update(node_name: str, payload: dict, emit: Callable[[str], None]) -> None:
+    """Execute function `_print_node_update`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        node_name (str): Input value used by this routine.
+        payload (dict): Input value used by this routine.
+        emit (Callable[[str], None]): Input value used by this routine.
+
+    Returns:
+        None: Result produced by this routine.
+    """
     emit(f"\n=== Node: {node_name} ===")
 
     if "step_count" in payload:
@@ -124,6 +225,13 @@ def _print_node_update(node_name: str, payload: dict, emit: Callable[[str], None
 
 
 def main() -> None:
+    """Execute function `main`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Returns:
+        None: Result produced by this routine.
+    """
     load_dotenv()
     args = parse_args()
     config = AgentConfig()
@@ -144,6 +252,16 @@ def main() -> None:
         log_handle = log_path.open("w", encoding="utf-8")
 
     def emit(line: str) -> None:
+        """Execute function `emit`.
+
+        This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+        Args:
+            line (str): Input value used by this routine.
+
+        Returns:
+            None: Result produced by this routine.
+        """
         print(line)
         if log_handle is not None:
             log_handle.write(line + "\n")

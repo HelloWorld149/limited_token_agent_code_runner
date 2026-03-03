@@ -55,6 +55,17 @@ def _truncate_output(text: str) -> str:
 
 
 def _safe_relative(path: Path, root: Path) -> str:
+    """Execute function `_safe_relative`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        path (Path): Input value used by this routine.
+        root (Path): Input value used by this routine.
+
+    Returns:
+        str: Result produced by this routine.
+    """
     try:
         return str(path.resolve().relative_to(root.resolve()))
     except Exception:
@@ -115,6 +126,18 @@ def list_directory(path: str, depth: int = 1) -> str:
     output: list[str] = []
 
     def walk(node: Path, remaining_depth: int, level: int) -> None:
+        """Execute function `walk`.
+
+        This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+        Args:
+            node (Path): Input value used by this routine.
+            remaining_depth (int): Input value used by this routine.
+            level (int): Input value used by this routine.
+
+        Returns:
+            None: Result produced by this routine.
+        """
         indent = "  " * level
         children = sorted(node.iterdir(), key=lambda child: (not child.is_dir(), child.name.lower()))
         for child in children:
@@ -150,6 +173,17 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
 
 
 def _iter_text_files(root: Path, include_build: bool = False) -> Iterable[Path]:
+    """Execute function `_iter_text_files`.
+
+    This routine is part of the agent workflow and keeps its existing runtime behavior.
+
+    Args:
+        root (Path): Input value used by this routine.
+        include_build (bool): Input value used by this routine.
+
+    Returns:
+        Iterable[Path]: Result produced by this routine.
+    """
     excluded_dirs = {".git", "dist", "out", "node_modules", "__pycache__"}
     if not include_build:
         excluded_dirs.add("build")
