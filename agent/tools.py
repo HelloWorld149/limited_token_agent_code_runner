@@ -240,14 +240,17 @@ def search_build_artifacts(regex_pattern: str) -> str:
     if not build_dir.exists():
         return "<no build directory found>"
 
-    # Only search known useful build artifact files
     useful_patterns = [
         "CMakeCache.txt",
         "CMakeError.log",
         "CMakeOutput.log",
         "CMakeConfigureLog.yaml",
         "LastTest.log",
+        "LastTestsFailed.log",
         "CTestTestfile.cmake",
+        "DartConfiguration.tcl",
+        "compile_commands.json",
+        "build.ninja",
     ]
 
     matches: list[str] = []
