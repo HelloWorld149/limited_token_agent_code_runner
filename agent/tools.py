@@ -28,13 +28,12 @@ _CRITICAL_PATTERNS = [
 ]
 
 
-def _truncate_output(text: str) -> str:
+def _truncate_output(text: str, max_chars: int = 3000) -> str:
     """Smart truncation that preserves critical build/test output patterns."""
     lines = text.splitlines()
-    if len(lines) <= 150 and len(text) <= 3000:
+    if len(lines) <= 150 and len(text) <= max_chars:
         return text
 
-    # Partition into head, tail, and critical lines from the middle
     head = lines[:40]
     tail = lines[-40:]
     head_set = set(range(40))
@@ -51,37 +50,40 @@ def _truncate_output(text: str) -> str:
         parts += critical
         parts.append("... <end of critical lines> ...")
     parts += tail
-    return "\n".join(parts)
+    result = "\n".join(parts)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n... <hard truncated>"
+    return result
 
 
-def _safe_relative(path: Path, root: Path) -> str:
-    """Execute function `_safe_relative`.
+def _normalize_command_for_platform(cmd: str) -> str:
+    """Normalize Unix-isms to Windows-compatible commands when running on Windows."""
+    if os.name != "nt":
+        return cmd
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        path (Path): Input value used by this routine.
-        root (Path): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    try:
-        return str(path.resolve().relative_to(root.resolve()))
-    except Exception:
-        return str(path)
+    normalized = cmd
+    normalized = re.sub(r"(^|[\s;&|])\./", r"\1", normalized)
+    normalized = normalized.replace("$(nproc)", "%NUMBER_OF_PROCESSORS%")
+    normalized = re.sub(r"\bexport\s+(\w+)=", r"set \1=", normalized)
+    normalized = re.sub(r"\brm\s+-rf\s+(\S+)", r"rmdir /s /q \1", normalized)
+    normalized = re.sub(r"\brm\s+-f\s+(\S+)", r"del /f \1", normalized)
+    return normalized
 
 
 @tool
 def execute_shell_command(cmd: str) -> str:
     """Run a shell command and capture both stdout and stderr with truncation logic."""
     normalized_cmd = _normalize_command_for_platform(cmd)
-    completed = subprocess.run(
-        normalized_cmd,
-        shell=True,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        completed = subprocess.run(
+            normalized_cmd,
+            shell=True,
+            text=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[cmd]={normalized_cmd}\n[exit_code]=124\n[stderr]\nCommand timed out after 300s"
     combined = (
         f"[cmd]={normalized_cmd}\n"
         f"[exit_code]={completed.returncode}\n"
@@ -91,30 +93,9 @@ def execute_shell_command(cmd: str) -> str:
     return _truncate_output(combined)
 
 
-def _normalize_command_for_platform(cmd: str) -> str:
-    """Normalize Unix-isms to Windows-compatible commands when running on Windows."""
-    if os.name != "nt":
-        return cmd
-
-    normalized = cmd
-    # Strip ./ prefix (Windows doesn't need it)
-    normalized = re.sub(r"(^|[\s;&|])\./", r"\1", normalized)
-    # Replace $(nproc) with Windows equivalent
-    normalized = normalized.replace("$(nproc)", "%NUMBER_OF_PROCESSORS%")
-    # Replace 'export VAR=val' with 'set VAR=val'
-    normalized = re.sub(r"\bexport\s+(\w+)=", r"set \1=", normalized)
-    # Replace forward-slash paths in common build directories
-    normalized = normalized.replace("build/tests/", "build\\tests\\")
-    # Replace 'rm -rf' with 'rmdir /s /q' for directory removal
-    normalized = re.sub(r"\brm\s+-rf\s+(\S+)", r"rmdir /s /q \1", normalized)
-    # Replace 'rm -f' with 'del /f'
-    normalized = re.sub(r"\brm\s+-f\s+(\S+)", r"del /f \1", normalized)
-    return normalized
-
-
 @tool
 def list_directory(path: str, depth: int = 1) -> str:
-    """List directory contents up to a bounded depth."""
+    """List directory contents up to a bounded depth (max 3)."""
     base = Path(path)
     if depth < 0:
         return "depth must be >= 0"
@@ -126,20 +107,15 @@ def list_directory(path: str, depth: int = 1) -> str:
     output: list[str] = []
 
     def walk(node: Path, remaining_depth: int, level: int) -> None:
-        """Execute function `walk`.
-
-        This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-        Args:
-            node (Path): Input value used by this routine.
-            remaining_depth (int): Input value used by this routine.
-            level (int): Input value used by this routine.
-
-        Returns:
-            None: Result produced by this routine.
-        """
         indent = "  " * level
-        children = sorted(node.iterdir(), key=lambda child: (not child.is_dir(), child.name.lower()))
+        try:
+            children = sorted(
+                node.iterdir(),
+                key=lambda c: (not c.is_dir(), c.name.lower()),
+            )
+        except PermissionError:
+            output.append(f"{indent}<permission denied>")
+            return
         for child in children:
             suffix = "/" if child.is_dir() else ""
             output.append(f"{indent}{child.name}{suffix}")
@@ -152,7 +128,7 @@ def list_directory(path: str, depth: int = 1) -> str:
 
 @tool
 def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
-    """Read a file chunk by explicit line range."""
+    """Read a file chunk by explicit line range (1-indexed, max 250 lines)."""
     if start_line <= 0 or end_line < start_line:
         return "invalid line range"
     if (end_line - start_line) > 250:
@@ -162,64 +138,64 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
     if not file_path.exists() or not file_path.is_file():
         return f"invalid file: {filepath}"
 
-    lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    try:
+        lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as e:
+        return f"read error: {e}"
+
     max_line = len(lines)
     start = min(start_line, max_line)
     end = min(end_line, max_line)
     selected = lines[start - 1 : end]
 
-    prefixed = [f"{index}: {line}" for index, line in enumerate(selected, start=start)]
+    prefixed = [f"{idx}: {line}" for idx, line in enumerate(selected, start=start)]
     return "\n".join(prefixed) if prefixed else "<no content>"
 
 
 def _iter_text_files(root: Path, include_build: bool = False) -> Iterable[Path]:
-    """Execute function `_iter_text_files`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        root (Path): Input value used by this routine.
-        include_build (bool): Input value used by this routine.
-
-    Returns:
-        Iterable[Path]: Result produced by this routine.
-    """
+    """Iterate text files under root, skipping binaries and non-essential dirs."""
     excluded_dirs = {".git", "dist", "out", "node_modules", "__pycache__"}
     if not include_build:
-        excluded_dirs.add("build")
+        excluded_dirs.update({"build", "build-mingw", "build-ninja"})
     for path in root.rglob("*"):
         if path.is_dir():
             continue
         if any(part in excluded_dirs for part in path.parts):
             continue
-        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".exe", ".dll", ".o", ".obj"}:
+        if path.suffix.lower() in {
+            ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip",
+            ".exe", ".dll", ".o", ".obj", ".a", ".so",
+        }:
             continue
         yield path
 
 
 @tool
 def search_codebase(regex_pattern: str) -> str:
-    """Search files with regex and return grep-like path:line:content matches."""
+    """Search source files with regex and return grep-like path:line:content matches."""
     try:
-        pattern = re.compile(regex_pattern)
+        pattern = re.compile(regex_pattern, re.IGNORECASE)
     except re.error as exc:
         return f"invalid regex: {exc}"
 
     root = Path.cwd()
     matches: list[str] = []
-    max_matches = 80
+    max_matches = 60
 
     for file_path in _iter_text_files(root):
         try:
             lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
-        rel = _safe_relative(file_path, root)
+        try:
+            rel = str(file_path.resolve().relative_to(root.resolve()))
+        except ValueError:
+            rel = str(file_path)
         for line_num, line in enumerate(lines, start=1):
             if pattern.search(line):
                 trimmed_line = line.strip()
-                if len(trimmed_line) > 220:
-                    trimmed_line = trimmed_line[:220] + " ..."
+                if len(trimmed_line) > 200:
+                    trimmed_line = trimmed_line[:200] + " ..."
                 matches.append(f"{rel}:{line_num}:{trimmed_line}")
                 if len(matches) >= max_matches:
                     return "\n".join(matches) + "\n... <match limit reached>"
@@ -227,58 +203,9 @@ def search_codebase(regex_pattern: str) -> str:
     return "\n".join(matches) if matches else "<no matches>"
 
 
-@tool
-def search_build_artifacts(regex_pattern: str) -> str:
-    """Search cmake build artifacts (CMakeCache, error logs, test logs) for debugging."""
-    try:
-        pattern = re.compile(regex_pattern)
-    except re.error as exc:
-        return f"invalid regex: {exc}"
-
-    root = Path.cwd()
-    build_dir = root / "build"
-    if not build_dir.exists():
-        return "<no build directory found>"
-
-    useful_patterns = [
-        "CMakeCache.txt",
-        "CMakeError.log",
-        "CMakeOutput.log",
-        "CMakeConfigureLog.yaml",
-        "LastTest.log",
-        "LastTestsFailed.log",
-        "CTestTestfile.cmake",
-        "DartConfiguration.tcl",
-        "compile_commands.json",
-        "build.ninja",
-    ]
-
-    matches: list[str] = []
-    max_matches = 100
-
-    for path in build_dir.rglob("*"):
-        if path.is_dir():
-            continue
-        if not any(path.name == p for p in useful_patterns):
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception:
-            continue
-        rel = _safe_relative(path, root)
-        for line_num, line in enumerate(lines, start=1):
-            if pattern.search(line):
-                matches.append(f"{rel}:{line_num}:{line}")
-                if len(matches) >= max_matches:
-                    return "\n".join(matches) + "\n... <match limit reached>"
-
-    return "\n".join(matches) if matches else "<no matches in build artifacts>"
-
-
 ALL_TOOLS = [
     execute_shell_command,
     list_directory,
     read_file_chunk,
     search_codebase,
-    search_build_artifacts,
 ]
