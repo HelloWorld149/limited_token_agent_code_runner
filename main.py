@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _truncate_text(value: str, max_chars: int = 1000) -> str:
+def _truncate_text(value: str, max_chars: int = 2000) -> str:
     """Execute function `_truncate_text`.
 
     This routine is part of the agent workflow and keeps its existing runtime behavior.
