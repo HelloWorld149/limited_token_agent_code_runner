@@ -37,10 +37,10 @@ def build_turn_graph(config: AgentConfig):
 
     Flow per turn:
         START -> classify_and_prepare -> retrieve_context -> route_by_intent:
-            ├── answer_question -> END
-            ├── run_build -> route_after_llm:
+            ├── answer_question -> route_after_llm:
             │       ├── execute_tools -> handle_tool_result -> continue_or_respond -> route_after_llm: ...
             │       └── END
+            ├── run_build -> route_after_llm: (same)
             ├── run_tests -> route_after_llm: (same)
             ├── explore_codebase -> route_after_llm: (same)
             └── exit -> END
@@ -93,11 +93,9 @@ def build_turn_graph(config: AgentConfig):
         },
     )
 
-    # answer_question produces text only
-    graph.add_edge("answer_question", END)
-
-    # Tool-using intents: route to tools or finish
-    for node_name in ("run_build", "run_tests", "explore_codebase", "continue_or_respond"):
+    # ALL intents (including QUESTION) use a ReAct tool loop.
+    # The LLM simply chooses not to call tools when pre-retrieved context suffices.
+    for node_name in ("answer_question", "run_build", "run_tests", "explore_codebase", "continue_or_respond"):
         graph.add_conditional_edges(
             node_name,
             lambda state: route_after_llm(state),

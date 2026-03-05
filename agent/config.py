@@ -36,6 +36,9 @@ class AgentConfig:
     failure_retry_limit: int = field(
         default_factory=lambda: int(os.getenv("AGENT_FAILURE_RETRY_LIMIT", "3"))
     )
+    max_tool_iterations: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "3"))
+    )
     workspace_path: Path = field(
         default_factory=lambda: Path(
             os.getenv("AGENT_WORKSPACE_PATH", "workspace/json")

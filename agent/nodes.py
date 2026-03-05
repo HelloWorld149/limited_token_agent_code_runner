@@ -11,7 +11,13 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 
 from agent.config import AgentConfig
-from agent.indexer import build_codebase_index, format_file_manifest_summary, search_index
+from agent.indexer import (
+    build_codebase_index,
+    detect_directory_references,
+    detect_file_references,
+    format_file_manifest_summary,
+    search_index,
+)
 from agent.intent import classify_intent_sync
 from agent.prompts import INTENT_PROMPT_MAP
 from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
@@ -89,38 +95,38 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
 # ===================================================================
 
 def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Search the codebase index for relevant snippets and inject into messages."""
+    """Three-layer retrieval: path-aware direct load -> keyword search -> (tool fallback via ReAct).
+
+    Layer 1: Detect explicit file paths/names in user input and load directly.
+    Layer 2: Enhanced keyword + symbol search with fuzzy path matching.
+    Layer 3 is handled by the ReAct tool loop in the LLM nodes (all intents have tools).
+    """
     user_input = state.get("last_user_input", "")
     index = state.get("codebase_index", CodebaseIndex())
     intent = state.get("current_intent", "QUESTION")
 
-    # Search the index for relevant items
-    results = search_index(index, user_input, max_results=10)
-
-    # Build context text from search results
     context_parts: list[str] = []
     ws = config.workspace_path
-
-    # Read relevant file chunks
-    token_budget_for_context = 1800  # ~1800 tokens for retrieved code
+    token_budget_for_context = 1800
     tokens_used = 0
-
-    files_to_read: list[tuple[str, int]] = []  # (rel_path, line)
-
-    for item in results:
-        if isinstance(item, SymbolEntry):
-            files_to_read.append((item.file, item.line))
-        elif isinstance(item, FileEntry):
-            files_to_read.append((item.path, 1))
-
-    # Deduplicate by file
     seen_files: set[str] = set()
-    for rel_path, line in files_to_read:
-        if rel_path in seen_files:
-            continue
-        seen_files.add(rel_path)
 
-        filepath = ws / rel_path
+    # ---------------------------------------------------------------
+    # Layer 1: Path-aware direct retrieval
+    # ---------------------------------------------------------------
+    # Detect explicit file path references and load them directly
+    referenced_files = detect_file_references(user_input, index)
+    # Also detect directory references
+    dir_files = detect_directory_references(user_input, index)
+    # Merge (referenced files first — higher priority)
+    direct_files = referenced_files + [f for f in dir_files if f.path not in {r.path for r in referenced_files}]
+
+    for fe in direct_files:
+        if fe.path in seen_files:
+            continue
+        seen_files.add(fe.path)
+
+        filepath = ws / fe.path
         if not filepath.exists() or not filepath.is_file():
             continue
 
@@ -130,24 +136,72 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             continue
 
         lines = content.splitlines()
-        # Read a window around the target line
-        start = max(0, line - 5)
-        end = min(len(lines), line + 40)
-        chunk = "\n".join(lines[start:end])
+        # For directly-referenced files, read up to 80 lines (head of file)
+        max_lines = min(80, len(lines))
+        chunk = "\n".join(lines[:max_lines])
 
         chunk_tokens = estimate_text_tokens(chunk, config.model_name)
         if tokens_used + chunk_tokens > token_budget_for_context:
             # Try a smaller chunk
-            end = min(len(lines), line + 15)
-            chunk = "\n".join(lines[start:end])
+            max_lines = min(30, len(lines))
+            chunk = "\n".join(lines[:max_lines])
             chunk_tokens = estimate_text_tokens(chunk, config.model_name)
             if tokens_used + chunk_tokens > token_budget_for_context:
                 continue
 
-        context_parts.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
+        # Include purpose info in the header
+        purpose_tag = f" [{fe.purpose}]" if fe.purpose else ""
+        context_parts.append(
+            f"--- {fe.path} (lines 1-{max_lines}){purpose_tag} ---\n{chunk}"
+        )
         tokens_used += chunk_tokens
 
-    # If no specific results, include the file manifest summary
+    # ---------------------------------------------------------------
+    # Layer 2: Enhanced keyword + symbol search (fills remaining budget)
+    # ---------------------------------------------------------------
+    if tokens_used < token_budget_for_context - 200:
+        results = search_index(index, user_input, max_results=10)
+
+        files_to_read: list[tuple[str, int]] = []
+        for item in results:
+            if isinstance(item, SymbolEntry):
+                files_to_read.append((item.file, item.line))
+            elif isinstance(item, FileEntry):
+                files_to_read.append((item.path, 1))
+
+        for rel_path, line in files_to_read:
+            if rel_path in seen_files:
+                continue
+            seen_files.add(rel_path)
+
+            filepath = ws / rel_path
+            if not filepath.exists() or not filepath.is_file():
+                continue
+
+            try:
+                content = filepath.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            lines_list = content.splitlines()
+            start = max(0, line - 5)
+            end = min(len(lines_list), line + 40)
+            chunk = "\n".join(lines_list[start:end])
+
+            chunk_tokens = estimate_text_tokens(chunk, config.model_name)
+            if tokens_used + chunk_tokens > token_budget_for_context:
+                end = min(len(lines_list), line + 15)
+                chunk = "\n".join(lines_list[start:end])
+                chunk_tokens = estimate_text_tokens(chunk, config.model_name)
+                if tokens_used + chunk_tokens > token_budget_for_context:
+                    continue
+
+            context_parts.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
+            tokens_used += chunk_tokens
+
+    # ---------------------------------------------------------------
+    # Fallback: if nothing retrieved, show file manifest
+    # ---------------------------------------------------------------
     if not context_parts:
         manifest = format_file_manifest_summary(index, max_entries=20)
         manifest = trim_text_to_token_budget(manifest, config.model_name, 800)
@@ -158,7 +212,6 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         context_text, config.model_name, token_budget_for_context
     )
 
-    # Store retrieved context as a HumanMessage annotation
     return {
         "_retrieved_context": context_text,
     }
@@ -169,8 +222,13 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 # ===================================================================
 
 def answer_question(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Generate an answer using retrieved context + conversation history."""
-    return _invoke_llm_with_context(state, config, use_tools=False)
+    """Generate an answer using retrieved context + conversation history.
+
+    Tool-augmented: the LLM can call read_file_chunk/list_directory/search_codebase
+    on-demand when pre-retrieved context is insufficient. It will simply choose
+    not to call tools when the context already answers the question.
+    """
+    return _invoke_llm_with_context(state, config, use_tools=True)
 
 
 # ===================================================================

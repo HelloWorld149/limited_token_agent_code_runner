@@ -42,6 +42,8 @@ class FileEntry:
     language: str
     size: int
     summary: str  # first-line / short description
+    purpose: str = ""  # computed: module type, key exports, architectural role
+    declarations: list[str] = field(default_factory=list)  # top-level class/function/module declarations
 
 
 @dataclass
