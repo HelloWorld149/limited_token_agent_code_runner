@@ -101,6 +101,8 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
         "current_intent": intent,
         "turn_count": turn_count,
         "_tool_iteration_count": 0,  # reset tool loop counter each turn
+        "_turn_subagent_count": 0,
+        "_turn_debug_logs": [f"intent={intent}"],
     }
 
     # --- Conversation Compressor Subagent ---
@@ -127,6 +129,11 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
                 max_output_tokens=400,
             )
             result["summary_of_knowledge"] = new_summary
+            result["_turn_subagent_count"] = 1
+            result["_turn_debug_logs"] = list(result.get("_turn_debug_logs", [])) + [
+                "subagent.conversation_compressor used=1",
+                f"conversation.recent_messages={len(messages[-6:])}",
+            ]
 
     return result
 
@@ -152,6 +159,8 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     raw_code_chunks: list[str] = []
     ws = config.workspace_path
+    debug_logs = list(state.get("_turn_debug_logs", []))
+    turn_subagent_count = int(state.get("_turn_subagent_count", 0))
 
     # When using retrieval subagent, read MORE raw code because the subagent
     # will compress it. Without subagent, use the original tight budget.
@@ -162,6 +171,8 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     tokens_used = 0
     seen_files: set[str] = set()
+    direct_loaded = 0
+    search_loaded = 0
 
     # ---------------------------------------------------------------
     # Layer 1: Path-aware direct retrieval
@@ -201,6 +212,7 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             f"--- {fe.path} (lines 1-{max_lines}){purpose_tag} ---\n{chunk}"
         )
         tokens_used += chunk_tokens
+        direct_loaded += 1
 
     # ---------------------------------------------------------------
     # Layer 2: Enhanced keyword + symbol search (fills remaining budget)
@@ -244,6 +256,7 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
             raw_code_chunks.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
             tokens_used += chunk_tokens
+            search_loaded += 1
 
     # ---------------------------------------------------------------
     # Fallback: if nothing retrieved, show file manifest
@@ -252,6 +265,13 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         manifest = format_file_manifest_summary(index, max_entries=20)
         manifest = trim_text_to_token_budget(manifest, config.model_name, 800)
         raw_code_chunks.append(f"--- File Manifest ---\n{manifest}")
+        debug_logs.append("retrieve.fallback=file_manifest")
+
+    debug_logs.append(
+        "retrieve.selection "
+        f"direct={direct_loaded} keyword={search_loaded} chunks={len(raw_code_chunks)} "
+        f"tokens={tokens_used}/{token_budget_for_raw}"
+    )
 
     # ---------------------------------------------------------------
     # Subagent compression: compress raw chunks into dense digest
@@ -282,12 +302,28 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
                     chunks.append(f"--- {rel_path} (lines {s+1}-{e}) ---\n" + "\n".join(lines_list[s:e]))
                 return chunks if chunks else raw_code_chunks
 
-            context_text = multi_hop_decomposer_sync(
+            multi_hop_result = multi_hop_decomposer_sync(
                 user_query=user_input,
                 raw_code_chunks=raw_code_chunks,
                 index_search_fn=_index_search_for_subquery,
                 model_name=config.subagent_model,
                 max_output_tokens=config.retrieval_digest_tokens,
+                return_trace=True,
+            )
+            if isinstance(multi_hop_result, tuple):
+                context_text, trace = multi_hop_result
+            else:
+                context_text, trace = multi_hop_result, {}
+            mh_used = int(trace.get("total_subagents_used", 0))
+            turn_subagent_count += mh_used
+            sub_queries = trace.get("sub_queries", [])
+            if isinstance(sub_queries, list) and sub_queries:
+                plan = " | ".join(str(q) for q in sub_queries[:3])
+                debug_logs.append(f"subagent.multi_hop.plan={plan[:280]}")
+            debug_logs.append(
+                "subagent.multi_hop "
+                f"used={mh_used} parallel={trace.get('parallel_subagents', 0)} "
+                f"merge={trace.get('merge_used', False)} fallback={trace.get('fallback_used', False)}"
             )
         else:
             # Simple compression: one retrieval subagent
@@ -298,15 +334,22 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
                 max_input_tokens=3500,
                 max_output_tokens=config.retrieval_digest_tokens,
             )
+            turn_subagent_count += 1
+            debug_logs.append(
+                f"subagent.retrieval_compressor used=1 chunks={len(raw_code_chunks)}"
+            )
     else:
         # No subagent: use raw chunks directly (original behavior)
         context_text = "\n\n".join(raw_code_chunks)
         context_text = trim_text_to_token_budget(
             context_text, config.model_name, 1800
         )
+        debug_logs.append("subagent.retrieval_compressor used=0")
 
     return {
         "_retrieved_context": context_text,
+        "_turn_subagent_count": turn_subagent_count,
+        "_turn_debug_logs": debug_logs,
     }
 
 
@@ -375,6 +418,9 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
     # --- Tool Output Summarizer Subagent ---
     # Compress large ToolMessage contents so they don't bloat the main context
     compressed_messages: list[BaseMessage] = []
+    summarizer_calls = 0
+    debug_logs = list(state.get("_turn_debug_logs", []))
+    turn_subagent_count = int(state.get("_turn_subagent_count", 0))
     if config.use_tool_summarizer:
         for msg in reversed(messages):
             if not isinstance(msg, ToolMessage):
@@ -398,8 +444,18 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
                         id=msg.id,
                     )
                 )
+                summarizer_calls += 1
 
-    result: dict[str, Any] = {"build_state": build_state, "_tool_iteration_count": iteration_count}
+    if summarizer_calls:
+        turn_subagent_count += summarizer_calls
+        debug_logs.append(f"subagent.tool_summarizer calls={summarizer_calls}")
+
+    result: dict[str, Any] = {
+        "build_state": build_state,
+        "_tool_iteration_count": iteration_count,
+        "_turn_subagent_count": turn_subagent_count,
+        "_turn_debug_logs": debug_logs,
+    }
     if compressed_messages:
         # Return compressed messages — add_messages reducer will merge by ID
         result["messages"] = compressed_messages

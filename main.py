@@ -46,6 +46,8 @@ def main() -> None:
         "last_user_input": "",
         "_retrieved_context": "",
         "_tool_iteration_count": 0,
+        "_turn_subagent_count": 0,
+        "_turn_debug_logs": [],
     }
 
     try:
@@ -97,6 +99,9 @@ def main() -> None:
 
 def _display_response(state: dict) -> None:
     """Print the most recent AI message to the user."""
+    trace_logs = state.get("_turn_debug_logs", [])
+    subagent_count = state.get("_turn_subagent_count", 0)
+
     messages = state.get("messages", [])
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
@@ -112,6 +117,10 @@ def _display_response(state: dict) -> None:
                 content = "\n".join(p for p in text_parts if p)
             if content and isinstance(content, str) and content.strip():
                 print(f"\nAssistant> {content.strip()}\n")
+                print(f"Trace> subagents_used={subagent_count}")
+                for line in trace_logs[:10]:
+                    print(f"Trace> {line}")
+                print()
                 return
     print("\nAssistant> (no response generated)\n")
 
