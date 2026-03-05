@@ -18,7 +18,7 @@ from agent.indexer import (
     format_file_manifest_summary,
     search_index,
 )
-from agent.intent import classify_followup_sync, classify_intent_sync
+from agent.intent import classify_intent_sync
 from agent.model_utils import build_chat_model, normalize_ai_message
 from agent.prompts import INTENT_PROMPT_MAP
 from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
@@ -92,6 +92,11 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     """Classify user intent (via lightweight LLM) and prepare retrieval context.
 
+    Uses a single context-aware classifier call.  The classifier receives
+    the previous intent and a short summary of the last assistant message
+    so it can resolve ambiguous follow-ups ("yes please", "do it") in one
+    pass without a separate follow-up classifier.
+
     Also runs the conversation compressor subagent every 3 turns to keep
     the rolling summary fresh and compact.
     """
@@ -104,24 +109,17 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
     if previous_intent == "EXIT":
         previous_intent = "QUESTION"
 
-    # Classify intent using separate lightweight LLM call (~110 tokens)
-    raw_intent = classify_intent_sync(user_input, config.classifier_model)
-    intent = raw_intent
+    # Build a short summary of the last assistant message so the classifier
+    # can understand what was offered / discussed.
+    last_ai_summary = _last_ai_text(messages)[:300]
 
-    if _is_ambiguous_followup(user_input, raw_intent):
-        last_ai_text = _last_ai_text(messages)
-        followup = classify_followup_sync(
-            user_input=user_input,
-            previous_intent=previous_intent,
-            last_ai_message=last_ai_text,
-            model_name=config.classifier_model,
-        )
-        if followup == "CONFIRM":
-            intent = previous_intent
-        elif followup == "CANCEL":
-            intent = "QUESTION"
-        elif followup == "EXIT":
-            intent = "EXIT"
+    # Single context-aware LLM call (~200 tokens, separate from main budget)
+    intent = classify_intent_sync(
+        user_input,
+        config.classifier_model,
+        previous_intent=previous_intent,
+        last_ai_summary=last_ai_summary,
+    )
 
     turn_count = state.get("turn_count", 0) + 1
     result: dict[str, Any] = {
@@ -129,13 +127,8 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
         "turn_count": turn_count,
         "_tool_iteration_count": 0,  # reset tool loop counter each turn
         "_turn_subagent_count": 0,
-        "_turn_debug_logs": [f"intent={intent} (raw={raw_intent})"],
+        "_turn_debug_logs": [f"intent={intent}"],
     }
-
-    if intent != raw_intent:
-        result["_turn_debug_logs"] = list(result.get("_turn_debug_logs", [])) + [
-            f"intent.override previous={previous_intent}",
-        ]
 
     # --- Conversation Compressor Subagent ---
     # Every 3 turns, re-compress the summary using a subagent.
@@ -775,50 +768,6 @@ def _last_ai_text(messages: list[BaseMessage]) -> str:
     return str(content)
 
 
-# Unambiguous exit phrases — only skip the followup classifier when the
-# user's text is an obvious exit command that no context could override.
-_HARD_EXIT_PHRASES: set[str] = {"exit", "quit", "bye", "goodbye", "done", "q"}
-
-
-def _is_ambiguous_followup(user_input: str, raw_intent: str) -> bool:
-    """Decide whether a message needs the follow-up classifier.
-
-    The main intent classifier sees *only* the user text — no conversation
-    history.  That means short confirmations like ``yes please``,
-    ``please do it!``, or ``go ahead`` are routinely misclassified as EXIT
-    or QUESTION.  The follow-up classifier is cheap (gpt-4o-mini, ~110
-    tokens) and *does* see the last assistant message, so we should invoke
-    it whenever there is reasonable doubt.
-
-    Rules:
-    1. Empty text → not ambiguous.
-    2. Text is a hard-coded exit phrase ("exit", "quit", …) → trust it.
-    3. Short messages (≤ 8 words) → always ambiguous.  The main classifier
-       simply doesn't have enough signal to be reliable on these.
-    4. Longer messages classified as QUESTION → ambiguous (user might be
-       elaborating on a previous action the assistant offered).
-    5. Everything else → not ambiguous.
-    """
-    text = user_input.strip()
-    if not text:
-        return False
-
-    # Hard exit phrases — trust them regardless of length.
-    normalised = re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
-    if normalised in _HARD_EXIT_PHRASES:
-        return False
-
-    # Short messages are inherently ambiguous without conversation context.
-    if len(text.split()) <= 8:
-        return True
-
-    # Longer messages classified as QUESTION could still be follow-ups.
-    if raw_intent == "QUESTION":
-        return True
-
-    return False
-
-
 __all__ = [
     "index_workspace",
     "classify_and_prepare",
@@ -827,6 +776,7 @@ __all__ = [
     "run_build",
     "run_tests",
     "explore_codebase",
+    "handle_exit",
     "handle_tool_result",
     "continue_or_respond",
     "route_by_intent",

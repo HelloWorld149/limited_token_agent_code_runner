@@ -9,6 +9,7 @@ from agent.nodes import (
     classify_and_prepare,
     continue_or_respond,
     explore_codebase,
+    handle_exit,
     handle_tool_result,
     index_workspace,
     retrieve_context,
@@ -75,6 +76,9 @@ def build_turn_graph(config: AgentConfig):
         "continue_or_respond",
         lambda state: continue_or_respond(state, config),
     )
+    graph.add_node(
+        "handle_exit", lambda state: handle_exit(state, config)
+    )
 
     # --- Edges ---
     graph.add_edge(START, "classify_and_prepare")
@@ -89,9 +93,11 @@ def build_turn_graph(config: AgentConfig):
             "run_build": "run_build",
             "run_tests": "run_tests",
             "explore_codebase": "explore_codebase",
-            "exit": END,
+            "exit": "handle_exit",
         },
     )
+
+    graph.add_edge("handle_exit", END)
 
     # ALL intents (including QUESTION) use a ReAct tool loop.
     # The LLM simply chooses not to call tools when pre-retrieved context suffices.

@@ -1,13 +1,10 @@
-"""Tests for agent/intent.py — keyword fallback classification,
-and agent/nodes.py — _is_ambiguous_followup heuristic.
-"""
+"""Tests for agent/intent.py — keyword fallback classification."""
 
 from __future__ import annotations
 
 import pytest
 
 from agent.intent import _fallback_classify, _fallback_followup
-from agent.nodes import _is_ambiguous_followup
 
 
 # ---------------------------------------------------------------------------
@@ -75,57 +72,3 @@ class TestFallbackFollowup:
 
     def test_empty_string(self) -> None:
         assert _fallback_followup("") == "NEW_REQUEST"
-
-
-# ---------------------------------------------------------------------------
-# _is_ambiguous_followup — heuristic gate for follow-up classifier
-# ---------------------------------------------------------------------------
-
-class TestIsAmbiguousFollowup:
-    """Ensure the heuristic correctly triggers the follow-up classifier."""
-
-    @pytest.mark.parametrize("text", ["yes please", "please do it!", "go ahead", "sure", "ok"])
-    def test_short_confirmations_are_ambiguous(self, text: str) -> None:
-        """Short confirmations must be treated as ambiguous, regardless of raw_intent."""
-        assert _is_ambiguous_followup(text, "EXIT") is True
-        assert _is_ambiguous_followup(text, "QUESTION") is True
-        assert _is_ambiguous_followup(text, "COMPILE") is True
-
-    @pytest.mark.parametrize("text", ["exit", "quit", "bye", "done", "q", "goodbye"])
-    def test_hard_exit_phrases_not_ambiguous(self, text: str) -> None:
-        """Unambiguous exit phrases should never trigger the followup classifier."""
-        assert _is_ambiguous_followup(text, "EXIT") is False
-
-    def test_empty_not_ambiguous(self) -> None:
-        assert _is_ambiguous_followup("", "QUESTION") is False
-        assert _is_ambiguous_followup("   ", "QUESTION") is False
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "yes please do it",
-            "no don't do that",
-            "I said go",
-            "do it!!!",
-            "please do it!!!",
-        ],
-    )
-    def test_short_messages_any_intent_are_ambiguous(self, text: str) -> None:
-        """Messages ≤ 8 words should be ambiguous regardless of raw intent."""
-        assert _is_ambiguous_followup(text, "EXIT") is True
-
-    def test_long_question_is_ambiguous(self) -> None:
-        """Longer messages classified as QUESTION are still ambiguous."""
-        long_q = "can you explain what the function does in more detail than before please now"
-        assert _is_ambiguous_followup(long_q, "QUESTION") is True
-
-    def test_long_non_question_not_ambiguous(self) -> None:
-        """Long messages with a non-QUESTION intent are not ambiguous."""
-        long_msg = "I want to understand the entire build system and the cmake configuration in great detail"
-        assert _is_ambiguous_followup(long_msg, "COMPILE") is False
-
-    def test_exit_with_punctuation_not_ambiguous(self) -> None:
-        """Hard exit phrases with punctuation should still be recognized."""
-        assert _is_ambiguous_followup("exit!", "EXIT") is False
-        assert _is_ambiguous_followup("quit.", "EXIT") is False
-        assert _is_ambiguous_followup("bye!!", "EXIT") is False

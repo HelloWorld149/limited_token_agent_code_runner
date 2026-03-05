@@ -96,6 +96,10 @@ def main() -> None:
         # Display the response
         _display_response(state)
 
+        # If the graph classified this turn as EXIT, break the REPL.
+        if state.get("current_intent") == "EXIT":
+            break
+
 
 def _display_response(state: dict) -> None:
     """Print the most recent AI message to the user."""

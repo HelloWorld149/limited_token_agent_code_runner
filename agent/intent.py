@@ -20,7 +20,14 @@ _CLASSIFIER_SYSTEM = (
     "- COMPILE: wants to build or compile the project (cmake, make, build)\n"
     "- RUN: wants to run tests or execute specific commands\n"
     "- EXPLORE: wants to browse, search, or navigate the codebase\n"
-    "- EXIT: wants to end the session (quit, exit, bye, done)\n"
+    "- EXIT: wants to end the session (quit, exit, bye, done)\n\n"
+    "IMPORTANT: You will be given optional dialog context (the previous intent "
+    "and a summary of the last assistant message). Use this context to correctly "
+    "resolve ambiguous follow-ups:\n"
+    "- If the user says 'yes', 'sure', 'do it', 'go ahead', 'please do' etc. "
+    "and the assistant just offered an action, classify as the intent matching "
+    "that action (EXPLORE, COMPILE, RUN, etc.), NOT as EXIT or QUESTION.\n"
+    "- Only classify as EXIT when the user clearly wants to end the session.\n"
 )
 
 _VALID_INTENTS: set[str] = {"QUESTION", "COMPILE", "RUN", "EXPLORE", "EXIT"}
@@ -43,19 +50,41 @@ _FOLLOWUP_SYSTEM = (
 async def classify_intent_async(
     user_input: str,
     model_name: str = "gpt-4o-mini",
+    *,
+    previous_intent: str = "",
+    last_ai_summary: str = "",
 ) -> Intent:
-    """Classify user intent via a lightweight LLM call (~110 tokens).
+    """Classify user intent via a lightweight LLM call (~200 tokens).
 
     This runs as a separate async task concurrently with context preparation.
     It does NOT consume main 5000-token budget.
+
+    When *previous_intent* and *last_ai_summary* are provided the classifier
+    can resolve ambiguous follow-ups ("yes please", "do it") in a single
+    pass — no second-stage follow-up classifier needed.
     """
     # Trim input — classifier only needs intent, not the full question (~200 tokens max)
     user_input = trim_text_to_token_budget(user_input, model_name, 200)
 
+    # Build the user payload.  When dialog context is available, prepend it
+    # so the LLM can resolve confirmations like "yes" or "do it".
+    if previous_intent and last_ai_summary:
+        last_ai_summary = trim_text_to_token_budget(
+            last_ai_summary, model_name, 150
+        )
+        payload = (
+            f"DIALOG CONTEXT (use to resolve ambiguous follow-ups):\n"
+            f"Previous intent: {previous_intent}\n"
+            f"Last assistant message summary: {last_ai_summary}\n\n"
+            f"USER MESSAGE:\n{user_input}"
+        )
+    else:
+        payload = user_input
+
     model = build_chat_model(model_name, temperature=0, max_tokens=10)
     messages = [
         SystemMessage(content=_CLASSIFIER_SYSTEM),
-        HumanMessage(content=user_input),
+        HumanMessage(content=payload),
     ]
     try:
         response = await model.ainvoke(messages)
@@ -74,9 +103,19 @@ async def classify_intent_async(
 def classify_intent_sync(
     user_input: str,
     model_name: str = "gpt-4o-mini",
+    *,
+    previous_intent: str = "",
+    last_ai_summary: str = "",
 ) -> Intent:
     """Synchronous wrapper for intent classification."""
-    return run_async(classify_intent_async(user_input, model_name))
+    return run_async(
+        classify_intent_async(
+            user_input,
+            model_name,
+            previous_intent=previous_intent,
+            last_ai_summary=last_ai_summary,
+        )
+    )
 
 
 async def classify_followup_async(

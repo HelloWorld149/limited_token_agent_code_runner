@@ -93,7 +93,7 @@ Per-turn (REPL loop):
     ├── run_build        ──┤── route_after_llm → execute_tools → handle_tool_result
     ├── run_tests        ──┤                      → continue_or_respond (ReAct loop)
     ├── explore_codebase ──┘
-    └── exit → END
+    └── exit → handle_exit → END
 ```
 
 The agent runs as a conversational REPL. At startup it indexes the workspace once. Then for each user turn it classifies intent, retrieves context, routes to the appropriate handler, and optionally loops through tools via a ReAct pattern.
@@ -262,10 +262,11 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 - `START → index_workspace → END`
 
 **`build_turn_graph(config) -> CompiledGraph`:**
-- Nodes: `classify_and_prepare`, `retrieve_context`, `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `execute_tools` (ToolNode), `handle_tool_result`, `continue_or_respond`
+- Nodes: `classify_and_prepare`, `retrieve_context`, `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `execute_tools` (ToolNode), `handle_tool_result`, `continue_or_respond`, `handle_exit`
 - All node lambdas close over `config` and call the corresponding function from `nodes.py`
 - Conditional edges:
-  - `retrieve_context → route_by_intent` → one of: `answer_question`, `run_build`, `run_tests`, `explore_codebase`, or `END` (exit)
+  - `retrieve_context → route_by_intent` → one of: `answer_question`, `run_build`, `run_tests`, `explore_codebase`, or `handle_exit` (exit)
+  - `handle_exit → END` (injects farewell AIMessage to prevent stale display)
   - `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `continue_or_respond` → `route_after_llm` → either `execute_tools` or `END` (respond_to_user)
   - `execute_tools → handle_tool_result → continue_or_respond` (loops back)
 
@@ -278,7 +279,7 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 | Function | Purpose |
 |---|---|
 | `index_workspace(state, config)` | Startup: verify workspace, `os.chdir()`, `set_workspace_root()`, `build_codebase_index()`, `_probe_environment()` |
-| `classify_and_prepare(state, config)` | Intent classification via `classify_intent_sync()`, follow-up handling via `classify_followup_sync()`, conversation compressor every 3 turns |
+| `classify_and_prepare(state, config)` | Single-pass context-aware intent classification via `classify_intent_sync()` (with dialog context), conversation compressor every 3 turns |
 | `retrieve_context(state, config)` | Three-layer retrieval + subagent compression (retrieval or multi-hop) |
 | `answer_question(state, config)` | QUESTION handler — calls `_invoke_llm_with_context(use_tools=True)` |
 | `run_build(state, config)` | COMPILE handler — calls `_invoke_llm_with_context(use_tools=True)` |
@@ -309,7 +310,6 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 
 - `_probe_environment(workspace_path)` — Detects OS, cmake, ninja, g++, make/mingw32-make, recommends generator
 - `_update_build_state(messages, current)` — Parses recent `ToolMessage`s for `[cmd]=` and `[exit_code]=` markers, returns a new frozen `BuildState`
-- `_is_ambiguous_followup(user_input, raw_intent)` — Returns `True` for short messages (≤8 words, regardless of raw intent) or QUESTION intent on longer messages; returns `False` only for empty input or hard exit phrases ("exit", "quit", etc.). The follow-up classifier is then invoked for *any* previous intent (including QUESTION) to properly handle confirmations like "yes please" or "please do it!".
 
 **retrieve_context Details:**
 
@@ -326,8 +326,8 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 
 | Function | Description |
 |---|---|
-| `classify_intent_sync(user_input, model_name)` | Classify user intent via lightweight LLM (~110 tokens, separate from main budget). Falls back to keyword heuristics. |
-| `classify_followup_sync(user_input, previous_intent, last_ai_message, model_name)` | Classify ambiguous follow-ups (e.g., "go ahead") as `CONFIRM`, `CANCEL`, `EXIT`, or `NEW_REQUEST` |
+| `classify_intent_sync(user_input, model_name, *, previous_intent, last_ai_summary)` | Classify user intent via lightweight context-aware LLM (~200 tokens, separate from main budget). Receives optional dialog context (previous intent + last AI summary) to resolve ambiguous follow-ups in a single pass. Falls back to keyword heuristics on error. |
+| `classify_followup_sync(user_input, previous_intent, last_ai_message, model_name)` | Legacy follow-up classifier (retained as utility). Classifies ambiguous follow-ups as `CONFIRM`, `CANCEL`, `EXIT`, or `NEW_REQUEST`. No longer used in the main flow — the context-aware `classify_intent_sync` handles this. |
 
 **Internal:**
 
@@ -336,7 +336,7 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 - `_normalize_text(text)` — Lowercase, collapse whitespace, strip non-alphanumeric
 - `_fuzzy_contains(tokens, lexicon, cutoff)` — Check if any token is in or fuzzy-matches the lexicon
 
-**Classifier System Prompt:** ~110 tokens, classifies into QUESTION / COMPILE / RUN / EXPLORE / EXIT.
+**Classifier System Prompt:** ~180 tokens, classifies into QUESTION / COMPILE / RUN / EXPLORE / EXIT. Includes instructions to use dialog context (previous intent + last assistant message summary) to resolve ambiguous follow-ups like "yes", "do it", "go ahead" — correctly mapping them to the offered action instead of misclassifying as EXIT.
 
 **Follow-up System Prompt:** Returns exactly one token: CONFIRM / CANCEL / EXIT / NEW_REQUEST.
 
@@ -539,9 +539,8 @@ User input → HumanMessage appended to state.messages
 turn_graph.invoke(state):
   ↓
   1. classify_and_prepare():
-     a. classify_intent_sync(user_input, classifier_model)  [separate LLM call, ~110 tokens]
-     b. If previous intent was COMPILE/RUN/EXPLORE and follow-up is ambiguous:
-        classify_followup_sync()  [separate LLM call]
+     a. classify_intent_sync(user_input, classifier_model, previous_intent=..., last_ai_summary=...)
+        [single context-aware LLM call, ~200 tokens, resolves follow-ups in one pass]
      c. Every 3 turns: conversation_compressor_sync()  [sub-agent LLM call]
      d. Return: current_intent, turn_count++, reset _tool_iteration_count
   ↓
@@ -554,7 +553,7 @@ turn_graph.invoke(state):
         - Simple? → retrieval_subagent_sync() [1 sub-agent LLM call]
      e. Return: _retrieved_context (compressed digest, ~400 tokens)
   ↓
-  3. route_by_intent() → answer_question / run_build / run_tests / explore_codebase / exit
+  3. route_by_intent() → answer_question / run_build / run_tests / explore_codebase / handle_exit
   ↓
   4. Intent handler (all call _invoke_llm_with_context):
      a. Select intent-specific system prompt
