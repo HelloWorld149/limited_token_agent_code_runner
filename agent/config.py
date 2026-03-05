@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
-from dotenv import load_dotenv
 
 
-load_dotenv()
+# The effective output cap — output_token_budget is nominally 1000 but
+# capped lower to leave formatting headroom.  Surfaced here so it is
+# visible in configuration rather than buried in _invoke_llm_with_context.
+_OUTPUT_HEADROOM_CAP = 800
 
 
 @dataclass(frozen=True)
@@ -29,12 +33,6 @@ class AgentConfig:
     )
     output_token_budget: int = field(
         default_factory=lambda: int(os.getenv("AGENT_OUTPUT_TOKENS", "1000"))
-    )
-    prune_threshold: int = field(
-        default_factory=lambda: int(os.getenv("AGENT_PRUNE_THRESHOLD", "3800"))
-    )
-    failure_retry_limit: int = field(
-        default_factory=lambda: int(os.getenv("AGENT_FAILURE_RETRY_LIMIT", "3"))
     )
     max_tool_iterations: int = field(
         default_factory=lambda: int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "3"))
@@ -78,3 +76,12 @@ class AgentConfig:
             raise ValueError("retrieval_digest_tokens must be < token_budget (5000)")
         if self.tool_summary_tokens >= self.token_budget:
             raise ValueError("tool_summary_tokens must be < token_budget (5000)")
+
+    @property
+    def effective_output_budget(self) -> int:
+        """The actual max_tokens sent to the LLM, capped for formatting headroom.
+
+        output_token_budget is nominally 1000 but we cap at _OUTPUT_HEADROOM_CAP
+        (800) to leave room for response formatting overhead.
+        """
+        return min(self.output_token_budget, _OUTPUT_HEADROOM_CAP)
