@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import re
+from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -21,6 +24,20 @@ _CLASSIFIER_SYSTEM = (
 )
 
 _VALID_INTENTS: set[str] = {"QUESTION", "COMPILE", "RUN", "EXPLORE", "EXIT"}
+_FOLLOWUP_DECISIONS: set[str] = {"CONFIRM", "CANCEL", "EXIT", "NEW_REQUEST"}
+
+FollowupDecision = Literal["CONFIRM", "CANCEL", "EXIT", "NEW_REQUEST"]
+
+_FOLLOWUP_SYSTEM = (
+    "You classify a short follow-up user reply in dialog context. "
+    "Return EXACTLY one token: CONFIRM, CANCEL, EXIT, or NEW_REQUEST.\n"
+    "Definitions:\n"
+    "- CONFIRM: user agrees to proceed with the previous assistant action.\n"
+    "- CANCEL: user declines, stops, or asks not to proceed.\n"
+    "- EXIT: user wants to end the whole session.\n"
+    "- NEW_REQUEST: user is asking something else.\n"
+    "Treat typos and informal language robustly."
+)
 
 
 async def classify_intent_async(
@@ -62,6 +79,60 @@ def classify_intent_sync(
     return run_async(classify_intent_async(user_input, model_name))
 
 
+async def classify_followup_async(
+    user_input: str,
+    previous_intent: Intent,
+    last_ai_message: str,
+    model_name: str = "gpt-4o-mini",
+) -> FollowupDecision:
+    """Classify short follow-up replies using prior-turn context.
+
+    This is designed for ambiguous confirmations like "go ahead", including typos.
+    """
+    user_input = trim_text_to_token_budget(user_input, model_name, 120)
+    last_ai_message = trim_text_to_token_budget(last_ai_message, model_name, 240)
+
+    model = build_chat_model(model_name, temperature=0, max_tokens=8)
+    user_payload = (
+        f"PREVIOUS_INTENT: {previous_intent}\n"
+        f"LAST_ASSISTANT_MESSAGE:\n{last_ai_message}\n\n"
+        f"USER_REPLY:\n{user_input}"
+    )
+
+    messages = [
+        SystemMessage(content=_FOLLOWUP_SYSTEM),
+        HumanMessage(content=user_payload),
+    ]
+
+    try:
+        response = await model.ainvoke(messages)
+        raw = extract_text(response.content).upper()
+        for token in raw.split():
+            cleaned = token.strip(".:,;!\"'")
+            if cleaned in _FOLLOWUP_DECISIONS:
+                return cleaned  # type: ignore[return-value]
+        return _fallback_followup(user_input)
+    except Exception:
+        return _fallback_followup(user_input)
+
+
+def classify_followup_sync(
+    user_input: str,
+    previous_intent: Intent,
+    last_ai_message: str,
+    model_name: str = "gpt-4o-mini",
+) -> FollowupDecision:
+    """Synchronous wrapper for follow-up classification."""
+    return run_async(
+        classify_followup_async(
+            user_input=user_input,
+            previous_intent=previous_intent,
+            last_ai_message=last_ai_message,
+            model_name=model_name,
+        )
+    )
+
+
 def _fallback_classify(user_input: str) -> Intent:
     """Keyword-based fallback when the LLM classifier fails."""
     lowered = user_input.lower().strip()
@@ -82,3 +153,42 @@ def _fallback_classify(user_input: str) -> Intent:
         return "EXPLORE"
 
     return "QUESTION"
+
+
+def _normalize_text(text: str) -> str:
+    lowered = text.lower().strip()
+    lowered = re.sub(r"\s+", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9\s]", "", lowered)
+    return lowered.strip()
+
+
+def _fuzzy_contains(tokens: list[str], lexicon: set[str], cutoff: float = 0.82) -> bool:
+    for token in tokens:
+        if token in lexicon:
+            return True
+        if difflib.get_close_matches(token, lexicon, n=1, cutoff=cutoff):
+            return True
+    return False
+
+
+def _fallback_followup(user_input: str) -> FollowupDecision:
+    """Typo-tolerant heuristic fallback for follow-up classification failures."""
+    normalized = _normalize_text(user_input)
+    if not normalized:
+        return "NEW_REQUEST"
+
+    tokens = normalized.split()
+
+    exit_words = {"exit", "quit", "bye", "goodbye", "q"}
+    cancel_words = {"no", "stop", "cancel", "dont", "nevermind", "nvm", "nah"}
+    confirm_words = {
+        "yes", "y", "ok", "okay", "sure", "proceed", "continue", "go", "ahead", "do", "it"
+    }
+
+    if _fuzzy_contains(tokens, exit_words, cutoff=0.9):
+        return "EXIT"
+    if _fuzzy_contains(tokens, cancel_words):
+        return "CANCEL"
+    if _fuzzy_contains(tokens, confirm_words):
+        return "CONFIRM"
+    return "NEW_REQUEST"

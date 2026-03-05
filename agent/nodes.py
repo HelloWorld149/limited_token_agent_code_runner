@@ -17,7 +17,7 @@ from agent.indexer import (
     format_file_manifest_summary,
     search_index,
 )
-from agent.intent import classify_intent_sync
+from agent.intent import classify_followup_sync, classify_intent_sync
 from agent.model_utils import build_chat_model, normalize_ai_message
 from agent.prompts import INTENT_PROMPT_MAP
 from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
@@ -92,9 +92,27 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
     the rolling summary fresh and compact.
     """
     user_input = state.get("last_user_input", "")
+    previous_intent = state.get("current_intent", "QUESTION")
+    messages = state.get("messages", [])
 
     # Classify intent using separate lightweight LLM call (~110 tokens)
-    intent = classify_intent_sync(user_input, config.classifier_model)
+    raw_intent = classify_intent_sync(user_input, config.classifier_model)
+    intent = raw_intent
+
+    if previous_intent in {"COMPILE", "RUN", "EXPLORE"} and _is_ambiguous_followup(user_input, raw_intent):
+        last_ai_text = _last_ai_text(messages)
+        followup = classify_followup_sync(
+            user_input=user_input,
+            previous_intent=previous_intent,
+            last_ai_message=last_ai_text,
+            model_name=config.classifier_model,
+        )
+        if followup == "CONFIRM":
+            intent = previous_intent
+        elif followup == "CANCEL":
+            intent = "QUESTION"
+        elif followup == "EXIT":
+            intent = "EXIT"
 
     turn_count = state.get("turn_count", 0) + 1
     result: dict[str, Any] = {
@@ -102,8 +120,13 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
         "turn_count": turn_count,
         "_tool_iteration_count": 0,  # reset tool loop counter each turn
         "_turn_subagent_count": 0,
-        "_turn_debug_logs": [f"intent={intent}"],
+        "_turn_debug_logs": [f"intent={intent} (raw={raw_intent})"],
     }
+
+    if intent != raw_intent:
+        result["_turn_debug_logs"] = list(result.get("_turn_debug_logs", [])) + [
+            f"intent.override previous={previous_intent}",
+        ]
 
     # --- Conversation Compressor Subagent ---
     # Every 3 turns, re-compress the summary using a subagent.
@@ -700,3 +723,30 @@ def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
         if isinstance(msg, AIMessage):
             return msg
     return None
+
+
+def _last_ai_text(messages: list[BaseMessage]) -> str:
+    last_ai = _last_ai_message(messages)
+    if last_ai is None:
+        return ""
+    content = last_ai.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _is_ambiguous_followup(user_input: str, raw_intent: str) -> bool:
+    text = user_input.strip()
+    if not text:
+        return False
+    if raw_intent in {"QUESTION", "EXIT"}:
+        return True
+    return len(text.split()) <= 4

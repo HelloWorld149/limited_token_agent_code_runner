@@ -27,6 +27,19 @@ _CRITICAL_PATTERNS = [
     re.compile(r"is not recognized as an internal or external command", re.IGNORECASE),
 ]
 
+_CTEST_SUMMARY_RE = re.compile(
+    r"(?P<pct>\d+)% tests passed,\s*(?P<failed>\d+)\s+tests? failed out of\s+(?P<total>\d+)",
+    re.IGNORECASE,
+)
+
+_ERROR_HINT_PATTERNS = [
+    re.compile(r"\berror\b", re.IGNORECASE),
+    re.compile(r"\bfatal\b", re.IGNORECASE),
+    re.compile(r"\bfailed\b", re.IGNORECASE),
+    re.compile(r"not recognized as an internal or external command", re.IGNORECASE),
+    re.compile(r"not a directory", re.IGNORECASE),
+]
+
 
 def _truncate_output(text: str, max_chars: int = 3000) -> str:
     """Smart truncation that preserves critical build/test output patterns."""
@@ -70,21 +83,54 @@ def _normalize_command_for_platform(cmd: str) -> str:
     return normalized
 
 
+def _extract_ctest_summary(stdout: str, stderr: str) -> str | None:
+    text = f"{stdout}\n{stderr}"
+    match = _CTEST_SUMMARY_RE.search(text)
+    if not match:
+        return None
+    pct = match.group("pct")
+    failed = match.group("failed")
+    total = match.group("total")
+    passed = max(0, int(total) - int(failed))
+    return f"{pct}% tests passed, {failed} tests failed out of {total} (passed={passed})"
+
+
+def _extract_error_hint(stdout: str, stderr: str) -> str | None:
+    for line in f"{stderr}\n{stdout}".splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(p.search(stripped) for p in _ERROR_HINT_PATTERNS):
+            return stripped[:220]
+    return None
+
+
 @tool
 def execute_shell_command(cmd: str) -> str:
     """Run a shell command and capture both stdout and stderr with truncation logic."""
     normalized_cmd = _normalize_command_for_platform(cmd)
-    try:
-        completed = subprocess.run(
-            normalized_cmd,
-            shell=True,
-            text=True,
-            capture_output=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        return f"[cmd]={normalized_cmd}\n[exit_code]=124\n[stderr]\nCommand timed out after 300s"
+    completed = subprocess.run(
+        normalized_cmd,
+        shell=True,
+        text=True,
+        capture_output=True,
+    )
+    status = "PASS" if completed.returncode == 0 else "FAIL"
+    ctest_summary = _extract_ctest_summary(completed.stdout, completed.stderr)
+    error_hint = _extract_error_hint(completed.stdout, completed.stderr)
+
+    metadata: list[str] = [
+        f"command={normalized_cmd}",
+        f"result={status} (exit_code={completed.returncode})",
+    ]
+    if ctest_summary:
+        metadata.append(f"tests={ctest_summary}")
+    if completed.returncode != 0 and error_hint:
+        metadata.append(f"error_hint={error_hint}")
+
     combined = (
+        "\n".join(metadata)
+        + "\n"
         f"[cmd]={normalized_cmd}\n"
         f"[exit_code]={completed.returncode}\n"
         f"[stdout]\n{completed.stdout}\n"
