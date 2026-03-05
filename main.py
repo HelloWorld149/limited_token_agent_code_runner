@@ -1,312 +1,118 @@
 from __future__ import annotations
 
-import argparse
-from dataclasses import replace
+import sys
 from pathlib import Path
-import re
-from typing import Callable
+
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.config import AgentConfig
-from agent.graph import build_graph
-
-
-def parse_args() -> argparse.Namespace:
-    """Execute function `parse_args`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Returns:
-        argparse.Namespace: Result produced by this routine.
-    """
-    parser = argparse.ArgumentParser(description="Context-constrained build agent")
-    parser.add_argument("--model", default=None, help="LLM model name")
-    parser.add_argument("--max-steps", type=int, default=None, help="Maximum reasoning loops")
-    parser.add_argument("--repo-dir", default=None, help="Local workspace directory")
-    parser.add_argument("--clone-url", default=None, help="Git repository URL to clone")
-    parser.add_argument("--verbose-loop", action="store_true", help="Print per-loop node updates")
-    parser.add_argument("--log-file", default="", help="Optional path to write runtime logs")
-    return parser.parse_args()
-
-
-def _truncate_text(value: str, max_chars: int = 2000) -> str:
-    """Execute function `_truncate_text`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        value (str): Input value used by this routine.
-        max_chars (int): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    if len(value) <= max_chars:
-        return value
-    return value[: max_chars - 24] + "\n... <truncated for display>"
-
-
-def _format_message_excerpt(message_obj: object) -> str:
-    """Execute function `_format_message_excerpt`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        message_obj (object): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    content = str(getattr(message_obj, "content", ""))
-    return _truncate_text(content.strip() or "<empty>", max_chars=900)
-
-
-def _extract_cmd(text: str) -> str | None:
-    """Execute function `_extract_cmd`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    match = re.search(r"^\[cmd\]=(.*)$", text, flags=re.MULTILINE)
-    return match.group(1).strip() if match else None
-
-
-def _extract_exit_code(text: str) -> int | None:
-    """Execute function `_extract_exit_code`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        int | None: Result produced by this routine.
-    """
-    match = re.search(r"\[exit_code\]\s*=\s*(\d+)|\[exit_code\]=(\d+)", text)
-    if not match:
-        return None
-    value = match.group(1) or match.group(2)
-    return int(value)
-
-
-def _extract_first_error_line(text: str) -> str | None:
-    """Execute function `_extract_first_error_line`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    for line in text.splitlines():
-        if re.search(r"\berror\b|\bfatal\b|\bfailed\b", line, flags=re.IGNORECASE):
-            return line.strip()
-    return None
-
-
-def _extract_test_summary(text: str) -> str | None:
-    """Execute function `_extract_test_summary`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    match = re.search(r"\d+% tests passed, \d+ tests failed out of \d+", text, flags=re.IGNORECASE)
-    if match:
-        return match.group(0)
-    if re.search(r"100% tests passed", text, flags=re.IGNORECASE):
-        return "100% tests passed"
-    return None
-
-
-def _extract_build_summary(text: str) -> str | None:
-    """Execute function `_extract_build_summary`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    count = len(re.findall(r"Built target ", text))
-    if count > 0:
-        return f"Built targets observed: {count}"
-    return None
-
-
-def _print_tool_result_summary(text: str, emit: Callable[[str], None]) -> None:
-    """Execute function `_print_tool_result_summary`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-        emit (Callable[[str], None]): Input value used by this routine.
-
-    Returns:
-        None: Result produced by this routine.
-    """
-    cmd = _extract_cmd(text)
-    exit_code = _extract_exit_code(text)
-    test_summary = _extract_test_summary(text)
-    build_summary = _extract_build_summary(text)
-    error_line = _extract_first_error_line(text)
-
-    if cmd:
-        emit(f"command={cmd}")
-    if exit_code is not None:
-        emit(f"result={'PASS' if exit_code == 0 else 'FAIL'} (exit_code={exit_code})")
-    if test_summary:
-        emit(f"tests={test_summary}")
-    if build_summary:
-        emit(f"build={build_summary}")
-    if error_line and (exit_code is None or exit_code != 0):
-        emit(f"error_hint={_truncate_text(error_line, max_chars=220)}")
-
-
-def _print_node_update(node_name: str, payload: dict, emit: Callable[[str], None]) -> None:
-    """Execute function `_print_node_update`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        node_name (str): Input value used by this routine.
-        payload (dict): Input value used by this routine.
-        emit (Callable[[str], None]): Input value used by this routine.
-
-    Returns:
-        None: Result produced by this routine.
-    """
-    emit(f"\n=== Node: {node_name} ===")
-
-    if "step_count" in payload:
-        emit(f"step_count={payload['step_count']}")
-    if "status" in payload:
-        emit(f"status={payload['status']}")
-    if "consecutive_errors" in payload:
-        emit(f"consecutive_errors={payload['consecutive_errors']}")
-
-    messages = payload.get("messages", [])
-    if isinstance(messages, list) and messages:
-        latest = messages[-1]
-        if isinstance(latest, ToolMessage):
-            emit("tool_output:")
-            _print_tool_result_summary(str(latest.content), emit)
-            emit(_format_message_excerpt(latest))
-        elif isinstance(latest, AIMessage):
-            tool_calls = getattr(latest, "tool_calls", None)
-            if tool_calls:
-                emit("ai_tool_call:")
-                emit(_truncate_text(str(tool_calls), max_chars=900))
-            else:
-                emit("ai_message:")
-                emit(_format_message_excerpt(latest))
-        else:
-            emit("message:")
-            emit(_format_message_excerpt(latest))
-
-    if "summary_of_knowledge" in payload:
-        emit("summary_of_knowledge:")
-        emit(_truncate_text(str(payload["summary_of_knowledge"]), max_chars=700))
+from agent.graph import build_init_graph, build_turn_graph
+from agent.state import BuildState, CodebaseIndex
 
 
 def main() -> None:
-    """Execute function `main`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Returns:
-        None: Result produced by this routine.
-    """
+    """Interactive REPL — the user asks questions, the agent responds."""
     load_dotenv()
-    args = parse_args()
+
     config = AgentConfig()
-    if args.model is not None:
-        config = replace(config, model_name=args.model)
-    if args.max_steps is not None:
-        config = replace(config, max_steps=args.max_steps)
-    if args.repo_dir is not None:
-        config = replace(config, repo_dir=Path(args.repo_dir))
-    if args.clone_url is not None:
-        config = replace(config, clone_url=args.clone_url)
-    graph = build_graph(config)
-    log_path = Path(args.log_file) if args.log_file else None
-    log_handle = None
 
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = log_path.open("w", encoding="utf-8")
+    # Verify workspace exists
+    ws = config.workspace_path
+    if not ws.exists() or not ws.is_dir():
+        print(f"ERROR: workspace not found at '{ws.resolve()}'")
+        print("The agent requires a pre-downloaded copy of nlohmann/json at workspace/json/")
+        sys.exit(1)
 
-    def emit(line: str) -> None:
-        """Execute function `emit`.
+    print("=" * 60)
+    print("  nlohmann/json Codebase Assistant")
+    print(f"  Workspace: {ws.resolve()}")
+    print(f"  Model: {config.model_name}")
+    print(f"  Token budget: {config.token_budget}")
+    print("=" * 60)
+    print("Commands: ask questions, 'build'/'compile', 'test'/'run', 'exit'/'quit'")
+    print()
 
-        This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-        Args:
-            line (str): Input value used by this routine.
-
-        Returns:
-            None: Result produced by this routine.
-        """
-        print(line)
-        if log_handle is not None:
-            log_handle.write(line + "\n")
-            log_handle.flush()
-
-    initial_state = {
-        "messages": [
-            HumanMessage(
-                content=(
-                    "Run the full clone/explore/build/test workflow for the repository "
-                    "and produce a final report."
-                )
-            )
-        ],
+    # Phase 1: Index the workspace (one-shot)
+    print("Indexing workspace...")
+    init_graph = build_init_graph(config)
+    init_state = {
+        "messages": [],
         "summary_of_knowledge": "",
-        "step_count": 0,
-        "consecutive_errors": 0,
-        "status": "EXPLORING",
+        "codebase_index": CodebaseIndex(),
+        "current_intent": "QUESTION",
+        "build_state": BuildState(),
+        "turn_count": 0,
+        "last_user_input": "",
+        "_retrieved_context": "",
     }
 
     try:
-        recursion_limit = max(50, config.max_steps * 4 + 10)
-        if not args.verbose_loop:
-            result = graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
-            last_message = result["messages"][-1]
-            emit(str(last_message.content))
-            return
+        state = init_graph.invoke(init_state, config={"recursion_limit": 10})
+        summary = state.get("summary_of_knowledge", "")
+        print(f"Ready! {summary[:200]}")
+    except Exception as e:
+        print(f"Startup error: {e}")
+        state = init_state
 
-        final_report = None
-        for event in graph.stream(initial_state, config={"recursion_limit": recursion_limit}, stream_mode="updates"):
-            if not isinstance(event, dict):
-                continue
-            for node_name, payload in event.items():
-                if isinstance(payload, dict):
-                    _print_node_update(node_name, payload, emit)
-                    if node_name == "generate_report":
-                        report_messages = payload.get("messages", [])
-                        if isinstance(report_messages, list) and report_messages:
-                            final_report = str(report_messages[-1].content)
+    print()
 
-        emit("\n=== Final Report ===")
-        emit(final_report or "<no final report captured>")
-    finally:
-        if log_handle is not None:
-            log_handle.close()
+    # Phase 2: Build per-turn graph
+    turn_graph = build_turn_graph(config)
+
+    # REPL loop
+    while True:
+        try:
+            user_input = input("You> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        # Check for exit
+        if user_input.lower() in ("exit", "quit", "bye", "q"):
+            print("Goodbye!")
+            break
+
+        # Inject user message into state
+        messages = list(state.get("messages", []))
+        messages.append(HumanMessage(content=user_input))
+        state["messages"] = messages
+        state["last_user_input"] = user_input
+
+        # Run one turn through the graph
+        try:
+            state = turn_graph.invoke(state, config={"recursion_limit": 50})
+        except Exception as e:
+            print(f"\nAgent error: {e}")
+            print("You can try again with a different question.\n")
+            continue
+
+        # Display the response
+        _display_response(state)
+
+
+def _display_response(state: dict) -> None:
+    """Print the most recent AI message to the user."""
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            content = msg.content
+            # Handle Responses API list-of-blocks format
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(p for p in text_parts if p)
+            if content and isinstance(content, str) and content.strip():
+                print(f"\nAssistant> {content.strip()}\n")
+                return
+    print("\nAssistant> (no response generated)\n")
 
 
 if __name__ == "__main__":
