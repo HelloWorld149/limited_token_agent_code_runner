@@ -27,6 +27,11 @@ from agent.token_utils import (
     sanitize_tool_message_sequence,
     trim_text_to_token_budget,
 )
+from agent.subagents import (
+    retrieval_subagent_sync,
+    should_summarize_tool_output,
+    tool_output_summarizer_sync,
+)
 from agent.tools import ALL_TOOLS
 
 
@@ -100,25 +105,33 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     Layer 1: Detect explicit file paths/names in user input and load directly.
     Layer 2: Enhanced keyword + symbol search with fuzzy path matching.
     Layer 3 is handled by the ReAct tool loop in the LLM nodes (all intents have tools).
+
+    When the retrieval subagent is enabled, raw code chunks are read with a LARGER
+    budget (~3000 tokens) and then compressed by a subagent into a dense digest
+    (~400 tokens). This frees up ~1400 tokens in the main context for reasoning.
     """
     user_input = state.get("last_user_input", "")
     index = state.get("codebase_index", CodebaseIndex())
     intent = state.get("current_intent", "QUESTION")
 
-    context_parts: list[str] = []
+    raw_code_chunks: list[str] = []
     ws = config.workspace_path
-    token_budget_for_context = 1800
+
+    # When using retrieval subagent, read MORE raw code because the subagent
+    # will compress it. Without subagent, use the original tight budget.
+    if config.use_retrieval_subagent:
+        token_budget_for_raw = 3000  # subagent compresses to ~400 tokens
+    else:
+        token_budget_for_raw = 1800  # goes directly into main context
+
     tokens_used = 0
     seen_files: set[str] = set()
 
     # ---------------------------------------------------------------
     # Layer 1: Path-aware direct retrieval
     # ---------------------------------------------------------------
-    # Detect explicit file path references and load them directly
     referenced_files = detect_file_references(user_input, index)
-    # Also detect directory references
     dir_files = detect_directory_references(user_input, index)
-    # Merge (referenced files first — higher priority)
     direct_files = referenced_files + [f for f in dir_files if f.path not in {r.path for r in referenced_files}]
 
     for fe in direct_files:
@@ -136,22 +149,19 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             continue
 
         lines = content.splitlines()
-        # For directly-referenced files, read up to 80 lines (head of file)
         max_lines = min(80, len(lines))
         chunk = "\n".join(lines[:max_lines])
 
         chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-        if tokens_used + chunk_tokens > token_budget_for_context:
-            # Try a smaller chunk
+        if tokens_used + chunk_tokens > token_budget_for_raw:
             max_lines = min(30, len(lines))
             chunk = "\n".join(lines[:max_lines])
             chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-            if tokens_used + chunk_tokens > token_budget_for_context:
+            if tokens_used + chunk_tokens > token_budget_for_raw:
                 continue
 
-        # Include purpose info in the header
         purpose_tag = f" [{fe.purpose}]" if fe.purpose else ""
-        context_parts.append(
+        raw_code_chunks.append(
             f"--- {fe.path} (lines 1-{max_lines}){purpose_tag} ---\n{chunk}"
         )
         tokens_used += chunk_tokens
@@ -159,7 +169,7 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     # ---------------------------------------------------------------
     # Layer 2: Enhanced keyword + symbol search (fills remaining budget)
     # ---------------------------------------------------------------
-    if tokens_used < token_budget_for_context - 200:
+    if tokens_used < token_budget_for_raw - 200:
         results = search_index(index, user_input, max_results=10)
 
         files_to_read: list[tuple[str, int]] = []
@@ -189,28 +199,41 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             chunk = "\n".join(lines_list[start:end])
 
             chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-            if tokens_used + chunk_tokens > token_budget_for_context:
+            if tokens_used + chunk_tokens > token_budget_for_raw:
                 end = min(len(lines_list), line + 15)
                 chunk = "\n".join(lines_list[start:end])
                 chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-                if tokens_used + chunk_tokens > token_budget_for_context:
+                if tokens_used + chunk_tokens > token_budget_for_raw:
                     continue
 
-            context_parts.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
+            raw_code_chunks.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
             tokens_used += chunk_tokens
 
     # ---------------------------------------------------------------
     # Fallback: if nothing retrieved, show file manifest
     # ---------------------------------------------------------------
-    if not context_parts:
+    if not raw_code_chunks:
         manifest = format_file_manifest_summary(index, max_entries=20)
         manifest = trim_text_to_token_budget(manifest, config.model_name, 800)
-        context_parts.append(f"--- File Manifest ---\n{manifest}")
+        raw_code_chunks.append(f"--- File Manifest ---\n{manifest}")
 
-    context_text = "\n\n".join(context_parts)
-    context_text = trim_text_to_token_budget(
-        context_text, config.model_name, token_budget_for_context
-    )
+    # ---------------------------------------------------------------
+    # Subagent compression: compress raw chunks into dense digest
+    # ---------------------------------------------------------------
+    if config.use_retrieval_subagent and raw_code_chunks:
+        context_text = retrieval_subagent_sync(
+            user_query=user_input,
+            raw_code_chunks=raw_code_chunks,
+            model_name=config.subagent_model,
+            max_input_tokens=3500,
+            max_output_tokens=config.retrieval_digest_tokens,
+        )
+    else:
+        # No subagent: use raw chunks directly (original behavior)
+        context_text = "\n\n".join(raw_code_chunks)
+        context_text = trim_text_to_token_budget(
+            context_text, config.model_name, 1800
+        )
 
     return {
         "_retrieved_context": context_text,
@@ -263,11 +286,13 @@ def explore_codebase(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 # ===================================================================
 
 def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Post-process tool results: update build state.
+    """Post-process tool results: update build state and compress large outputs.
 
-    NOTE: We do NOT return 'messages' here because the add_messages reducer
-    would re-add them (duplication). Message pruning happens at the LLM call
-    boundary in _invoke_llm_with_context via fit_messages_to_budget.
+    When the tool output summarizer is enabled, large shell command outputs
+    are compressed by a subagent into ~200 tokens. This prevents build logs
+    and test outputs from consuming the main 5000-token budget.
+
+    Returns compressed messages via add_messages reducer to replace originals.
     """
     messages = list(state.get("messages", []))
 
@@ -275,9 +300,38 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
     build_state = state.get("build_state", BuildState())
     build_state = _update_build_state(messages, build_state)
 
-    return {
-        "build_state": build_state,
-    }
+    # --- Tool Output Summarizer Subagent ---
+    # Compress large ToolMessage contents so they don't bloat the main context
+    compressed_messages: list[BaseMessage] = []
+    if config.use_tool_summarizer:
+        for msg in reversed(messages):
+            if not isinstance(msg, ToolMessage):
+                break
+            content = str(msg.content)
+            if should_summarize_tool_output(content):
+                # Extract command from output for context
+                cmd = _extract_cmd(content) or "unknown"
+                compressed = tool_output_summarizer_sync(
+                    tool_output=content,
+                    command=cmd,
+                    model_name=config.subagent_model,
+                    max_input_tokens=3500,
+                    max_output_tokens=config.tool_summary_tokens,
+                )
+                # Create a replacement ToolMessage with compressed content
+                compressed_messages.append(
+                    ToolMessage(
+                        content=compressed,
+                        tool_call_id=msg.tool_call_id,
+                        id=msg.id,
+                    )
+                )
+
+    result: dict[str, Any] = {"build_state": build_state}
+    if compressed_messages:
+        # Return compressed messages — add_messages reducer will merge by ID
+        result["messages"] = compressed_messages
+    return result
 
 
 # ===================================================================

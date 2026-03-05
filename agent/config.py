@@ -44,6 +44,22 @@ class AgentConfig:
             os.getenv("AGENT_WORKSPACE_PATH", "workspace/json")
         )
     )
+    # --- Subagent configuration ---
+    subagent_model: str = field(
+        default_factory=lambda: os.getenv("AGENT_SUBAGENT_MODEL", "gpt-5.3-codex")
+    )
+    use_retrieval_subagent: bool = field(
+        default_factory=lambda: os.getenv("AGENT_USE_RETRIEVAL_SUBAGENT", "true").lower() == "true"
+    )
+    use_tool_summarizer: bool = field(
+        default_factory=lambda: os.getenv("AGENT_USE_TOOL_SUMMARIZER", "true").lower() == "true"
+    )
+    retrieval_digest_tokens: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_RETRIEVAL_DIGEST_TOKENS", "400"))
+    )
+    tool_summary_tokens: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_TOOL_SUMMARY_TOKENS", "200"))
+    )
 
     def __post_init__(self) -> None:
         if self.input_token_budget + self.output_token_budget > self.token_budget:
