@@ -72,3 +72,4 @@ class AgentState(TypedDict):
     build_state: BuildState
     turn_count: int
     last_user_input: str
+    _retrieved_context: str  # transient: set by retrieve_context, read by LLM nodes

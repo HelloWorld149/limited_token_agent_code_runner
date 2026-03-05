@@ -5,47 +5,110 @@ from langgraph.prebuilt import ToolNode
 
 from agent.config import AgentConfig
 from agent.nodes import (
-    agent_reasoner,
-    context_manager,
-    generate_report,
-    initialize_workspace,
-    route_from_reasoner,
+    answer_question,
+    classify_and_prepare,
+    continue_or_respond,
+    explore_codebase,
+    handle_tool_result,
+    index_workspace,
+    retrieve_context,
+    route_after_llm,
+    route_by_intent,
+    run_build,
+    run_tests,
 )
 from agent.state import AgentState
 from agent.tools import ALL_TOOLS
 
 
-def build_graph(config: AgentConfig):
-    """Execute function `build_graph`.
+def build_init_graph(config: AgentConfig):
+    """Build a one-shot graph that indexes the workspace at startup."""
+    graph = StateGraph(AgentState)
+    graph.add_node(
+        "index_workspace", lambda state: index_workspace(state, config)
+    )
+    graph.add_edge(START, "index_workspace")
+    graph.add_edge("index_workspace", END)
+    return graph.compile()
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
 
-    Args:
-        config (AgentConfig): Input value used by this routine.
+def build_turn_graph(config: AgentConfig):
+    """Build a per-turn graph that processes one user message.
 
-    Returns:
-        Any: Result produced by this routine.
+    Flow per turn:
+        START -> classify_and_prepare -> retrieve_context -> route_by_intent:
+            ├── answer_question -> END
+            ├── run_build -> route_after_llm:
+            │       ├── execute_tools -> handle_tool_result -> continue_or_respond -> route_after_llm: ...
+            │       └── END
+            ├── run_tests -> route_after_llm: (same)
+            ├── explore_codebase -> route_after_llm: (same)
+            └── exit -> END
     """
     graph = StateGraph(AgentState)
 
-    graph.add_node("initialize_workspace", lambda state: initialize_workspace(state, config))
-    graph.add_node("agent_reasoner", lambda state: agent_reasoner(state, config))
+    # --- Nodes ---
+    graph.add_node(
+        "classify_and_prepare",
+        lambda state: classify_and_prepare(state, config),
+    )
+    graph.add_node(
+        "retrieve_context", lambda state: retrieve_context(state, config)
+    )
+    graph.add_node(
+        "answer_question", lambda state: answer_question(state, config)
+    )
+    graph.add_node(
+        "run_build", lambda state: run_build(state, config)
+    )
+    graph.add_node(
+        "run_tests", lambda state: run_tests(state, config)
+    )
+    graph.add_node(
+        "explore_codebase", lambda state: explore_codebase(state, config)
+    )
     graph.add_node("execute_tools", ToolNode(ALL_TOOLS))
-    graph.add_node("context_manager", lambda state: context_manager(state, config))
-    graph.add_node("generate_report", lambda state: generate_report(state, config))
+    graph.add_node(
+        "handle_tool_result", lambda state: handle_tool_result(state, config)
+    )
+    graph.add_node(
+        "continue_or_respond",
+        lambda state: continue_or_respond(state, config),
+    )
 
-    graph.add_edge(START, "initialize_workspace")
-    graph.add_edge("initialize_workspace", "agent_reasoner")
+    # --- Edges ---
+    graph.add_edge(START, "classify_and_prepare")
+    graph.add_edge("classify_and_prepare", "retrieve_context")
+
+    # Route by intent
     graph.add_conditional_edges(
-        "agent_reasoner",
-        lambda state: route_from_reasoner(state, config),
+        "retrieve_context",
+        lambda state: route_by_intent(state),
         {
-            "execute_tools": "execute_tools",
-            "generate_report": "generate_report",
+            "answer_question": "answer_question",
+            "run_build": "run_build",
+            "run_tests": "run_tests",
+            "explore_codebase": "explore_codebase",
+            "exit": END,
         },
     )
-    graph.add_edge("execute_tools", "context_manager")
-    graph.add_edge("context_manager", "agent_reasoner")
-    graph.add_edge("generate_report", END)
+
+    # answer_question produces text only
+    graph.add_edge("answer_question", END)
+
+    # Tool-using intents: route to tools or finish
+    for node_name in ("run_build", "run_tests", "explore_codebase", "continue_or_respond"):
+        graph.add_conditional_edges(
+            node_name,
+            lambda state: route_after_llm(state),
+            {
+                "execute_tools": "execute_tools",
+                "respond_to_user": END,
+            },
+        )
+
+    # Tool execution loop
+    graph.add_edge("execute_tools", "handle_tool_result")
+    graph.add_edge("handle_tool_result", "continue_or_respond")
 
     return graph.compile()

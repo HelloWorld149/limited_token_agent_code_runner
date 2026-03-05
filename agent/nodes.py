@@ -2,1569 +2,502 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
-import re
-import subprocess
 from typing import Any
-from urllib.parse import urlparse
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 from agent.config import AgentConfig
-from agent.prompts import REASONER_SYSTEM_PROMPT, REPORT_SYSTEM_PROMPT
-from agent.state import AgentState
-from agent.token_utils import estimate_token_count, trim_text_to_token_budget
+from agent.indexer import build_codebase_index, format_file_manifest_summary, search_index
+from agent.intent import classify_intent_sync
+from agent.prompts import INTENT_PROMPT_MAP
+from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
+from agent.token_utils import (
+    estimate_text_tokens,
+    fit_messages_to_budget,
+    sanitize_tool_message_sequence,
+    trim_text_to_token_budget,
+)
+from agent.tools import ALL_TOOLS
 
 
-def _repo_name_from_url(url: str) -> str:
-    """Extract the repository name from a git clone URL."""
-    path = urlparse(url).path
-    name = Path(path).stem
-    return name or "repo"
+# ===================================================================
+# Node: index_workspace — runs once at startup
+# ===================================================================
 
-
-def initialize_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Execute function `initialize_workspace`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        dict[str, Any]: Result produced by this routine.
-    """
-    repo_parent = config.repo_dir
-    repo_parent.mkdir(parents=True, exist_ok=True)
-    repo_name = _repo_name_from_url(config.clone_url)
-    repo_path = repo_parent / repo_name
-
-    if repo_path.exists() and (repo_path / ".git").exists():
-        summary = f"Workspace already initialized; repository folder exists at {repo_path}."
-    else:
-        clone_cmd = f"git clone {config.clone_url}"
-        result = subprocess.run(clone_cmd, text=True, capture_output=True, shell=True, cwd=str(repo_parent))
-        if result.returncode != 0 and "already exists" not in (result.stderr or ""):
-            summary = (
-                "Workspace initialization attempted but clone failed. "
-                f"stderr: {(result.stderr or '').strip()[:300]}"
-            )
-        else:
-            summary = f"Workspace initialized and repository cloned into {repo_path}."
-
-    if repo_path.exists() and repo_path.is_dir():
-        os.chdir(repo_path)
-        summary = _merge_summary(summary, f"Working directory set to {repo_path}.")
-
-    # --- Environment Detection Phase ---
-    env_facts = _probe_environment(repo_path)
-    summary = _merge_summary(summary, "Environment: " + " | ".join(env_facts))
-
-    message = HumanMessage(
-        content=(
-            "Start exploring and building the cloned repository. "
-            "First discover the project structure and build system, then build and run tests. "
-            "Read the environment facts in the knowledge summary and adapt your build commands accordingly. "
-            "Use tools iteratively and stop with a clear final report."
-        )
-    )
-
-    return {
-        "messages": [message],
-        "summary_of_knowledge": _merge_summary(state.get("summary_of_knowledge", ""), summary),
-        "status": "EXPLORING",
-    }
-
-
-def _probe_environment(repo_path: Path) -> list[str]:
-    """Detect OS, available build tools, recommended cmake generator, and fix common issues."""
-    env_facts: list[str] = []
-
-    # 1. OS detection
-    env_facts.append(f"os={platform.system()}")
-    env_facts.append(f"os_name={os.name}")
-
-    # 2. Clean stale build directory to avoid cmake cache conflicts
-    build_dir = repo_path / "build"
-    if build_dir.exists():
-        try:
-            shutil.rmtree(build_dir, ignore_errors=True)
-            env_facts.append("stale_build_dir=cleaned")
-        except Exception:
-            env_facts.append("stale_build_dir=cleanup_failed")
-
-    # 3. Windows long paths — enable automatically
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                "git config core.longpaths true",
-                shell=True, capture_output=True, text=True, timeout=5,
-                cwd=str(repo_path),
-            )
-            env_facts.append("git_longpaths=enabled")
-        except Exception:
-            env_facts.append("git_longpaths=failed_to_enable")
-
-    # 4. Detect available tools
-    tool_checks = [
-        ("cmake --version", "cmake"),
-        ("g++ --version", "gxx"),
-        ("cl", "msvc"),
-        ("ninja --version", "ninja"),
-        ("mingw32-make --version", "mingw32_make"),
-        ("make --version", "make"),
-    ]
-    for cmd, label in tool_checks:
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-            available = result.returncode == 0
-            first_line = (result.stdout or result.stderr or "").strip().split("\n")[0][:100]
-            env_facts.append(f"{label}={'yes: ' + first_line if available else 'not found'}")
-        except Exception:
-            env_facts.append(f"{label}=check_failed")
-
-    # 5. Detect best cmake generator
-    if os.name == "nt":
-        if shutil.which("ninja"):
-            env_facts.append("recommended_generator=Ninja")
-        elif shutil.which("mingw32-make"):
-            env_facts.append("recommended_generator=MinGW Makefiles")
-        elif shutil.which("cl"):
-            env_facts.append("recommended_generator=default (Visual Studio)")
-        else:
-            env_facts.append("recommended_generator=unknown (no build tool found)")
-    else:
-        if shutil.which("ninja"):
-            env_facts.append("recommended_generator=Ninja")
-        else:
-            env_facts.append("recommended_generator=default (Unix Makefiles)")
-
-    # 6. Path length risk assessment (Windows 260 char limit)
-    path_len = len(str(repo_path.resolve()))
-    if path_len > 120:
-        env_facts.append(f"path_length_risk=high ({path_len} chars)")
-    else:
-        env_facts.append(f"path_length_risk=low ({path_len} chars)")
-
-    return env_facts
-
-
-def agent_reasoner(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Execute function `agent_reasoner`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        dict[str, Any]: Result produced by this routine.
-    """
-    from agent.tools import ALL_TOOLS
-
-    force_report, reason = _should_force_report_due_to_stagnation(state, config)
-    if force_report:
+def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Verify workspace exists and build the in-memory codebase index."""
+    ws = config.workspace_path.resolve()
+    if not ws.exists() or not ws.is_dir():
         return {
-            "messages": [
-                AIMessage(
-                    content=(
-                        "Stopping iterative tool execution due to stagnation. "
-                        f"Reason: {reason}. Proceed to final report using collected evidence."
-                    )
-                )
-            ],
-            "step_count": state["step_count"] + 1,
+            "summary_of_knowledge": (
+                f"ERROR: workspace path '{ws}' does not exist. "
+                "The agent requires a pre-downloaded copy of nlohmann/json."
+            ),
+            "codebase_index": CodebaseIndex(),
+            "build_state": BuildState(),
+            "turn_count": 0,
         }
 
-    reasoner_output_budget = _reasoner_output_budget(config)
+    # Change working directory to the workspace
+    os.chdir(ws)
 
-    model = _build_chat_model(config.model_name, reasoner_output_budget).bind_tools(ALL_TOOLS)
+    # Build index (use resolved absolute path)
+    index = build_codebase_index(ws)
 
-    system = SystemMessage(content=REASONER_SYSTEM_PROMPT)
-    summary_context = HumanMessage(content=f"Knowledge summary: {state['summary_of_knowledge']}")
-    history = list(state["messages"])
-    stagnation_hint = _build_stagnation_hint(state, history)
-    messages_for_model = _fit_reasoner_messages_to_budget(
-        system=system,
-        summary_context=summary_context,
-        history=history,
-        model_name=config.model_name,
-        input_budget=config.input_token_budget,
-        stagnation_hint=stagnation_hint,
+    # Detect environment
+    env_facts = _probe_environment(ws)
+
+    summary = (
+        f"Workspace: {ws.resolve()} | "
+        f"Files: {len(index.files)} | Symbols: {len(index.symbols)} | "
+        + " | ".join(env_facts)
     )
-    messages_for_model = _sanitize_tool_message_sequence(messages_for_model)
-
-    try:
-        response = model.invoke(messages_for_model)
-    except Exception as exc:
-        fallback = AIMessage(
-            content=(
-                "LLM invocation failed in agent_reasoner. "
-                f"Error: {type(exc).__name__}: {str(exc)[:220]}. "
-                "Stopping tool loop and routing to final report generation."
-            )
-        )
-        return {
-            "messages": [fallback],
-            "step_count": state["step_count"] + 1,
-            "status": "FAILED",
-        }
-
-    # Reflective retry: if the model stops on FAILED status, ask it to reconsider with evidence.
-    if _should_reflect_on_failure(state, config, response):
-        reflection_hint = HumanMessage(content=_build_failure_reflection_hint(state))
-        reflected_messages = [*messages_for_model, response, reflection_hint]
-        reflected_messages = _fit_messages_to_budget(
-            reflected_messages,
-            model_name=config.model_name,
-            input_budget=config.input_token_budget,
-        )
-        reflected_messages = _sanitize_tool_message_sequence(reflected_messages)
-        try:
-            reflected_response = model.invoke(reflected_messages)
-        except Exception:
-            reflected_response = response
-        if getattr(reflected_response, "tool_calls", None):
-            response = reflected_response
 
     return {
-        "messages": [response],
-        "step_count": state["step_count"] + 1,
-    }
-
-
-def _should_reflect_on_failure(state: AgentState, config: AgentConfig, response: AIMessage) -> bool:
-    """If the model tries to stop after failure, trigger one reflective re-reasoning pass."""
-    if getattr(response, "tool_calls", None):
-        return False
-
-    if state["status"] not in ("FAILED",):
-        return False
-
-    if state["step_count"] >= config.max_steps - 2:
-        return False
-
-    if state.get("consecutive_errors", 0) >= config.failure_retry_limit:
-        return False
-
-    return True
-
-
-def _build_failure_reflection_hint(state: AgentState) -> str:
-    """Execute function `_build_failure_reflection_hint`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    last_tool = _last_tool_message(state.get("messages", []))
-    last_cmd = _extract_cmd(str(last_tool.content)) if last_tool is not None else None
-    last_error = _extract_error_signature(last_tool.content) if last_tool is not None else None
-
-    parts = [
-        "You attempted to stop while status is FAILED.",
-        "Re-evaluate the latest evidence and propose a different next action.",
-        "Do not repeat identical discovery calls unless they add new evidence.",
-    ]
-    if last_cmd:
-        parts.append(f"Last command: {last_cmd}")
-    if last_error:
-        parts.append(f"Last error signal: {last_error}")
-    parts.append(
-        "Choose the next tool call that most directly reduces uncertainty or addresses the failure root cause."
-    )
-    return " ".join(parts)
-
-
-def _last_tool_message(messages: list[BaseMessage]) -> ToolMessage | None:
-    """Execute function `_last_tool_message`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        ToolMessage | None: Result produced by this routine.
-    """
-    for message in reversed(messages):
-        if isinstance(message, ToolMessage):
-            return message
-    return None
-
-
-def _fit_messages_to_budget(
-    messages: list[BaseMessage],
-    model_name: str,
-    input_budget: int,
-) -> list[BaseMessage]:
-    """Execute function `_fit_messages_to_budget`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-        model_name (str): Input value used by this routine.
-        input_budget (int): Input value used by this routine.
-
-    Returns:
-        list[BaseMessage]: Result produced by this routine.
-    """
-    current_messages = list(messages)
-    while estimate_token_count(current_messages, model_name) > input_budget and len(current_messages) > 2:
-        if not _pop_oldest_tool_observation_pair(current_messages):
-            current_messages.pop(0)
-    return current_messages
-
-
-def context_manager(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Execute function `context_manager`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        dict[str, Any]: Result produced by this routine.
-    """
-    messages = list(state["messages"])
-    token_count = estimate_token_count(messages, config.model_name)
-    dropped: list[BaseMessage] = []
-
-    while token_count > config.prune_threshold and len(messages) > 4:
-        protected_indexes = _important_message_indexes(messages)
-        pair = _pop_oldest_tool_observation_pair(messages, protected_indexes)
-        if pair:
-            dropped.extend(pair)
-        else:
-            removed = _pop_oldest_non_protected_message(messages, protected_indexes)
-            if removed is None and messages:
-                removed = messages.pop(0)
-            if removed is not None:
-                dropped.append(removed)
-            else:
-                break
-        token_count = estimate_token_count(messages, config.model_name)
-
-    messages = _sanitize_tool_message_sequence(messages)
-
-    summary = state["summary_of_knowledge"]
-    if dropped:
-        summary_update = _summarize_messages(dropped)
-        summary = _merge_summary(summary, summary_update)
-    summary = _cap_summary(summary, config)
-
-    consecutive_errors = _compute_consecutive_errors(state)
-    status = _infer_status(state)
-
-    return {
-        "messages": messages,
         "summary_of_knowledge": summary,
-        "consecutive_errors": consecutive_errors,
-        "status": status,
+        "codebase_index": index,
+        "build_state": BuildState(),
+        "turn_count": 0,
+        "current_intent": "QUESTION",
+        "last_user_input": "",
     }
 
 
-def generate_report(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Execute function `generate_report`.
+# ===================================================================
+# Node: classify_and_prepare — intent classification + context prep
+# ===================================================================
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
+def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Classify user intent (via lightweight LLM) and prepare retrieval context."""
+    user_input = state.get("last_user_input", "")
 
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
+    # Classify intent using separate lightweight LLM call (~110 tokens)
+    intent = classify_intent_sync(user_input, config.classifier_model)
 
-    Returns:
-        dict[str, Any]: Result produced by this routine.
+    return {
+        "current_intent": intent,
+        "turn_count": state.get("turn_count", 0) + 1,
+    }
+
+
+# ===================================================================
+# Node: retrieve_context — search index and inject relevant snippets
+# ===================================================================
+
+def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Search the codebase index for relevant snippets and inject into messages."""
+    user_input = state.get("last_user_input", "")
+    index = state.get("codebase_index", CodebaseIndex())
+    intent = state.get("current_intent", "QUESTION")
+
+    # Search the index for relevant items
+    results = search_index(index, user_input, max_results=10)
+
+    # Build context text from search results
+    context_parts: list[str] = []
+    ws = config.workspace_path
+
+    # Read relevant file chunks
+    token_budget_for_context = 1800  # ~1800 tokens for retrieved code
+    tokens_used = 0
+
+    files_to_read: list[tuple[str, int]] = []  # (rel_path, line)
+
+    for item in results:
+        if isinstance(item, SymbolEntry):
+            files_to_read.append((item.file, item.line))
+        elif isinstance(item, FileEntry):
+            files_to_read.append((item.path, 1))
+
+    # Deduplicate by file
+    seen_files: set[str] = set()
+    for rel_path, line in files_to_read:
+        if rel_path in seen_files:
+            continue
+        seen_files.add(rel_path)
+
+        filepath = ws / rel_path
+        if not filepath.exists() or not filepath.is_file():
+            continue
+
+        try:
+            content = filepath.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        lines = content.splitlines()
+        # Read a window around the target line
+        start = max(0, line - 5)
+        end = min(len(lines), line + 40)
+        chunk = "\n".join(lines[start:end])
+
+        chunk_tokens = estimate_text_tokens(chunk, config.model_name)
+        if tokens_used + chunk_tokens > token_budget_for_context:
+            # Try a smaller chunk
+            end = min(len(lines), line + 15)
+            chunk = "\n".join(lines[start:end])
+            chunk_tokens = estimate_text_tokens(chunk, config.model_name)
+            if tokens_used + chunk_tokens > token_budget_for_context:
+                continue
+
+        context_parts.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
+        tokens_used += chunk_tokens
+
+    # If no specific results, include the file manifest summary
+    if not context_parts:
+        manifest = format_file_manifest_summary(index, max_entries=20)
+        manifest = trim_text_to_token_budget(manifest, config.model_name, 800)
+        context_parts.append(f"--- File Manifest ---\n{manifest}")
+
+    context_text = "\n\n".join(context_parts)
+    context_text = trim_text_to_token_budget(
+        context_text, config.model_name, token_budget_for_context
+    )
+
+    # Store retrieved context as a HumanMessage annotation
+    return {
+        "_retrieved_context": context_text,
+    }
+
+
+# ===================================================================
+# Node: answer_question — handle QUESTION intent
+# ===================================================================
+
+def answer_question(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Generate an answer using retrieved context + conversation history."""
+    return _invoke_llm_with_context(state, config, use_tools=False)
+
+
+# ===================================================================
+# Node: run_build — handle COMPILE intent
+# ===================================================================
+
+def run_build(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Handle build requests — LLM decides which build commands to run via tools."""
+    return _invoke_llm_with_context(state, config, use_tools=True)
+
+
+# ===================================================================
+# Node: run_tests — handle RUN intent
+# ===================================================================
+
+def run_tests(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Handle test execution requests — LLM uses tools to run and interpret tests."""
+    return _invoke_llm_with_context(state, config, use_tools=True)
+
+
+# ===================================================================
+# Node: explore_codebase — handle EXPLORE intent
+# ===================================================================
+
+def explore_codebase(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Handle codebase exploration requests — LLM uses tools to browse/search."""
+    return _invoke_llm_with_context(state, config, use_tools=True)
+
+
+# ===================================================================
+# Node: execute_tools_node — execute tool calls from LLM
+# ===================================================================
+
+def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Post-process tool results: update build state.
+
+    NOTE: We do NOT return 'messages' here because the add_messages reducer
+    would re-add them (duplication). Message pruning happens at the LLM call
+    boundary in _invoke_llm_with_context via fit_messages_to_budget.
     """
-    report_output_budget = _report_output_budget(config)
+    messages = list(state.get("messages", []))
 
-    model = _build_chat_model(config.model_name, report_output_budget)
-    system = SystemMessage(content=REPORT_SYSTEM_PROMPT)
-    environment_facts = _collect_environment_facts(config)
-    command_evidence = _build_command_evidence_snapshot(state)
-    report_request = HumanMessage(
-        content=(
-            f"Status: {state['status']}\n"
-            f"Consecutive errors: {state['consecutive_errors']}\n"
-            f"Step count: {state['step_count']}\n"
-            f"Knowledge summary: {state['summary_of_knowledge']}\n"
-            f"Environment facts:\n{environment_facts}\n"
-            f"Command evidence:\n{command_evidence}\n"
-            "Use recent messages as evidence and produce the final report."
-        )
+    # Update build state based on tool output
+    build_state = state.get("build_state", BuildState())
+    build_state = _update_build_state(messages, build_state)
+
+    return {
+        "build_state": build_state,
+    }
+
+
+# ===================================================================
+# Node: continue_or_respond — after tools, decide: more tools or final text?
+# ===================================================================
+
+def continue_or_respond(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """After tool execution, call LLM to either make more tool calls or produce a text response."""
+    return _invoke_llm_with_context(state, config, use_tools=True)
+
+
+# ===================================================================
+# Router functions
+# ===================================================================
+
+def route_by_intent(state: AgentState) -> str:
+    """Route to the appropriate handler based on classified intent."""
+    intent = state.get("current_intent", "QUESTION")
+    if intent == "EXIT":
+        return "exit"
+    if intent == "COMPILE":
+        return "run_build"
+    if intent == "RUN":
+        return "run_tests"
+    if intent == "EXPLORE":
+        return "explore_codebase"
+    return "answer_question"
+
+
+def route_after_llm(state: AgentState) -> str:
+    """Check if the LLM wants to call tools or has produced a final text response."""
+    messages = state.get("messages", [])
+    last = _last_ai_message(messages)
+    if last and getattr(last, "tool_calls", None):
+        return "execute_tools"
+    return "respond_to_user"
+
+
+# ===================================================================
+# Shared LLM invocation helper
+# ===================================================================
+
+def _invoke_llm_with_context(
+    state: AgentState,
+    config: AgentConfig,
+    use_tools: bool,
+) -> dict[str, Any]:
+    """Build messages under token budget and invoke the main LLM."""
+    intent = state.get("current_intent", "QUESTION")
+    system_text = INTENT_PROMPT_MAP.get(intent, INTENT_PROMPT_MAP["QUESTION"])
+    system = SystemMessage(content=system_text)
+
+    # Build summary context message
+    summary = state.get("summary_of_knowledge", "")
+    retrieved = state.get("_retrieved_context", "")
+    summary_content = f"Knowledge: {summary}"
+    if retrieved:
+        summary_content += f"\n\nRetrieved code:\n{retrieved}"
+    summary_msg = HumanMessage(content=summary_content)
+
+    # Conversation history
+    history = list(state.get("messages", []))
+
+    # Build candidate message list
+    candidate = [system, summary_msg] + history
+
+    # Fit to input budget (reserve some for tool schemas if using tools)
+    effective_budget = config.input_token_budget
+    if use_tools:
+        effective_budget -= 300  # reserve for tool schemas
+
+    candidate = fit_messages_to_budget(candidate, config.model_name, effective_budget)
+    candidate = sanitize_tool_message_sequence(candidate)
+
+    output_budget = min(config.output_token_budget, 800)
+
+    # Build model — use Responses API for codex models, chat completions otherwise
+    use_responses = _is_responses_model(config.model_name)
+    model = ChatOpenAI(
+        model=config.model_name,
+        temperature=0,
+        max_tokens=output_budget,
+        **({"use_responses_api": True} if use_responses else {}),
     )
-    report_messages = _fit_report_messages_to_budget(
-        system=system,
-        history=list(state["messages"]),
-        report_request=report_request,
-        model_name=config.model_name,
-        input_budget=config.input_token_budget,
-    )
-    report_messages = _sanitize_tool_message_sequence(report_messages)
+    if use_tools:
+        model = model.bind_tools(ALL_TOOLS)
+
     try:
-        response = model.invoke(report_messages)
+        response = model.invoke(candidate)
+        # Normalize content: Responses API may return list-of-blocks instead of str
+        response = _normalize_ai_message(response)
     except Exception as exc:
         response = AIMessage(
-            content=_build_local_fallback_report(state, config, exc)
+            content=f"LLM error: {type(exc).__name__}: {str(exc)[:200]}. "
+            "Please rephrase or try again."
         )
+
     return {"messages": [response]}
 
 
-def _build_local_fallback_report(state: AgentState, config: AgentConfig, error: Exception) -> str:
-    """Execute function `_build_local_fallback_report`.
+# ===================================================================
+# Model type detection
+# ===================================================================
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
+_RESPONSES_API_PATTERNS = ("codex", "o1", "o3", "o4")
+_CHAT_ONLY_PREFIXES = ("gpt-4o", "gpt-4-", "gpt-3.5")
 
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
-        error (Exception): Input value used by this routine.
 
-    Returns:
-        str: Result produced by this routine.
+def _is_responses_model(model_name: str) -> bool:
+    """Return True if the model should use the Responses API.
+
+    Codex and reasoning models (o1/o3/o4) use the Responses API.
+    Standard chat models (gpt-4o, gpt-3.5) use the chat completions API.
     """
-    environment_facts = _collect_environment_facts(config)
-    command_evidence = _build_command_evidence_snapshot(state)
-    return (
-        "## Final Build/Test Report (Local Fallback)\n\n"
-        "LLM report generation failed due to a connection/runtime error, so this summary is generated locally.\n\n"
-        f"- LLM error: {type(error).__name__}: {str(error)[:300]}\n"
-        f"- Status: {state.get('status')}\n"
-        f"- Step count: {state.get('step_count')}\n"
-        f"- Consecutive errors: {state.get('consecutive_errors')}\n\n"
-        "### Environment Facts\n"
-        f"{environment_facts}\n\n"
-        "### Command Evidence\n"
-        f"{command_evidence}\n\n"
-        "### Knowledge Summary\n"
-        f"{state.get('summary_of_knowledge', '')[:2000]}"
+    name_lower = model_name.lower()
+    # Explicitly chat-only models first
+    if any(name_lower.startswith(p) for p in _CHAT_ONLY_PREFIXES):
+        return False
+    return any(p in name_lower for p in _RESPONSES_API_PATTERNS)
+
+
+def _normalize_ai_message(msg: AIMessage) -> AIMessage:
+    """Normalize AIMessage content from list-of-blocks (Responses API) to str."""
+    content = msg.content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        content = "\n".join(p for p in text_parts if p)
+    if not isinstance(content, str):
+        content = str(content)
+    return AIMessage(
+        content=content,
+        tool_calls=msg.tool_calls if msg.tool_calls else [],
+        id=msg.id,
     )
 
 
-def route_from_reasoner(state: AgentState, config: AgentConfig) -> str:
-    """Execute function `route_from_reasoner`.
+# ===================================================================
+# Environment probing
+# ===================================================================
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
+def _probe_environment(workspace_path: Path) -> list[str]:
+    """Detect OS, build tools, and recommended cmake generator."""
+    import subprocess
 
-    Args:
-        state (AgentState): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
+    facts: list[str] = []
+    facts.append(f"os={platform.system()}")
 
-    Returns:
-        str: Result produced by this routine.
-    """
-    if state["step_count"] >= config.max_steps:
-        return "generate_report"
+    tool_checks = [
+        ("cmake --version", "cmake"),
+        ("ninja --version", "ninja"),
+    ]
+    if os.name == "nt":
+        tool_checks.extend([
+            ("g++ --version", "gxx"),
+            ("mingw32-make --version", "mingw32_make"),
+        ])
+    else:
+        tool_checks.extend([
+            ("g++ --version", "gxx"),
+            ("make --version", "make"),
+        ])
 
-    last = _last_ai_message(state["messages"])
-    if last and getattr(last, "tool_calls", None):
-        return "execute_tools"
-    return "generate_report"
+    for cmd, label in tool_checks:
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                first_line = (result.stdout or "").strip().split("\n")[0][:80]
+                facts.append(f"{label}={first_line}")
+            else:
+                facts.append(f"{label}=not_found")
+        except Exception:
+            facts.append(f"{label}=check_failed")
 
+    # Recommended generator
+    if os.name == "nt":
+        if shutil.which("ninja"):
+            facts.append("generator=Ninja")
+        elif shutil.which("mingw32-make"):
+            facts.append("generator=MinGW Makefiles")
+        else:
+            facts.append("generator=default")
+    else:
+        facts.append("generator=Ninja" if shutil.which("ninja") else "generator=Unix Makefiles")
 
-def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
-    """Execute function `_last_ai_message`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        AIMessage | None: Result produced by this routine.
-    """
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            return message
-    return None
-
-
-def _summarize_messages(messages: list[BaseMessage]) -> str:
-    """Execute function `_summarize_messages`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    if not messages:
-        return "Pruned context contained no actionable tool details."
-
-    findings: list[str] = []
-    commands: list[str] = []
-    errors: list[str] = []
-    files: list[str] = []
-
-    for message in messages:
-        text = str(message.content)
-        lowered = text.lower()
-
-        cmd_line = _extract_cmd(text)
-        if cmd_line:
-            commands.append(cmd_line[:160])
-
-        if "[exit_code]" in lowered:
-            exit_line = _first_matching_line(text, r"\[exit_code\]\s*=\s*\d+|\[exit_code\]=\d+")
-            if exit_line:
-                findings.append(exit_line)
-
-            if "test" in lowered:
-                test_summary = _extract_test_summary(text)
-                if test_summary:
-                    findings.append(test_summary)
-            build_summary = _extract_build_summary(text)
-            if build_summary:
-                findings.append(build_summary)
-
-        tool_error = _extract_error_signature(text)
-        if tool_error:
-            errors.append(tool_error[:160])
-
-        file_line = _first_matching_line(text, r"[\w\-./\\]+\.(cpp|cc|cxx|h|hpp|cmake|txt):\d+")
-        if file_line:
-            files.append(file_line[:140])
-
-    parts: list[str] = []
-    if commands:
-        parts.append("commands=" + " ; ".join(_unique_keep_order(commands)[:2]))
-    if findings:
-        parts.append("results=" + " ; ".join(_unique_keep_order(findings)[:2]))
-    if errors:
-        parts.append("errors=" + " ; ".join(_unique_keep_order(errors)[:2]))
-    if files:
-        parts.append("files=" + " ; ".join(_unique_keep_order(files)[:2]))
-
-    if not parts:
-        return "Pruned tool context had no retained build/test/error signals."
-    return "Pruned context summary: " + " | ".join(parts) + "."
+    return facts
 
 
-def _merge_summary(existing: str, update: str) -> str:
-    """Execute function `_merge_summary`.
+# ===================================================================
+# Build state tracking
+# ===================================================================
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
+def _update_build_state(
+    messages: list[BaseMessage], current: BuildState
+) -> BuildState:
+    """Update build state based on recent tool outputs."""
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        text = str(msg.content)
+        if "[cmd]=" not in text or "[exit_code]=" not in text:
+            continue
 
-    Args:
-        existing (str): Input value used by this routine.
-        update (str): Input value used by this routine.
+        cmd = _extract_cmd(text) or ""
+        exit_code = _extract_exit_code(text)
+        cmd_lower = cmd.lower()
 
-    Returns:
-        str: Result produced by this routine.
-    """
-    if not existing:
-        return update
-    return f"{existing} {update}".strip()
+        new_state = BuildState(
+            status=current.status,
+            configured=current.configured,
+            built=current.built,
+            tested=current.tested,
+            last_exit_code=exit_code,
+            last_error=current.last_error,
+            consecutive_errors=current.consecutive_errors,
+        )
 
+        if exit_code is not None and exit_code != 0:
+            error_line = _first_error_line(text) or f"exit code {exit_code}"
+            new_state.status = "FAILED"
+            new_state.last_error = error_line[:200]
+            new_state.consecutive_errors = current.consecutive_errors + 1
+        else:
+            new_state.consecutive_errors = 0
+            new_state.last_error = ""
 
-def _cap_summary(summary: str, config: AgentConfig) -> str:
-    """Execute function `_cap_summary`.
+        # Detect lifecycle stage
+        if re.search(r"\bcmake\b", cmd_lower) and "--build" not in cmd_lower:
+            if exit_code == 0:
+                new_state.configured = True
+                new_state.status = "CONFIGURING"
+        elif re.search(r"--build|\bmake\b|\bninja\b|\bmingw32-make\b", cmd_lower):
+            if exit_code == 0:
+                new_state.built = True
+                new_state.status = "BUILDING"
+        elif re.search(r"\bctest\b|\btest\b", cmd_lower):
+            if exit_code == 0:
+                new_state.tested = True
+                new_state.status = "SUCCESS"
+            elif exit_code is not None:
+                new_state.status = "FAILED"
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        summary (str): Input value used by this routine.
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    max_summary_tokens = max(256, min(1200, config.input_token_budget // 3))
-    return trim_text_to_token_budget(summary, config.model_name, max_summary_tokens)
-
-
-def _compute_consecutive_errors(state: AgentState) -> int:
-    """Execute function `_compute_consecutive_errors`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-
-    Returns:
-        int: Result produced by this routine.
-    """
-    tool_messages = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
-    if not tool_messages:
-        return state.get("consecutive_errors", 0)
-
-    last_signature = _extract_error_signature(tool_messages[-1].content)
-    if not last_signature:
-        return 0
-
-    previous = state.get("consecutive_errors", 0)
-    if len(tool_messages) >= 2:
-        prev_signature = _extract_error_signature(tool_messages[-2].content)
-        if prev_signature == last_signature:
-            return previous + 1
-    return 1
+        return new_state
+    return current
 
 
-def _extract_error_signature(text: Any) -> str | None:
-    """Execute function `_extract_error_signature`.
+# ===================================================================
+# Text extraction helpers
+# ===================================================================
 
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
+def _extract_cmd(text: str) -> str | None:
+    match = re.search(r"^\[cmd\]=(.*)$", text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else None
 
-    Args:
-        text (Any): Input value used by this routine.
 
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    content = str(text)
-
-    # Treat structured command output as authoritative for errors.
-    if "[cmd]=" in content and "[exit_code]=" in content:
-        cmd = (_extract_cmd(content) or "").strip()
-        code = _extract_exit_code(content)
-        if code is not None and code != 0:
-            line = _first_matching_line(content, r".*\b(error|failed|fatal)\b.*")
-            if line:
-                return f"{cmd}: {line}"[:200]
-            return f"{cmd}: non-zero exit code {code}"[:200]
+def _extract_exit_code(text: str) -> int | None:
+    match = re.search(r"\[exit_code\]\s*=\s*(\d+)|\[exit_code\]=(\d+)", text)
+    if not match:
         return None
+    value = match.group(1) or match.group(2)
+    return int(value)
 
-    # For non-shell tool outputs, only count explicit tool validation failures.
-    validation_error = _first_matching_line(
-        content,
-        r"line range too large|invalid line range|invalid regex|invalid file|invalid directory|depth too large",
-    )
-    if validation_error:
-        return validation_error[:200]
 
-    # Ignore incidental words like 'error' found in search results/changelog lines.
-    return None
-
-
-def _infer_status(state: AgentState) -> str:
-    """Execute function `_infer_status`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    tool_messages = [msg for msg in state["messages"] if isinstance(msg, ToolMessage)]
-    if not tool_messages:
-        return state["status"]
-
-    last_text = str(tool_messages[-1].content)
-    last = last_text.lower()
-    if "[cmd]=" not in last and "[exit_code]=" not in last:
-        return state["status"]
-
-    cmd = (_extract_cmd(last_text) or "").lower()
-    exit_code = _extract_exit_code(last_text)
-
-    # CTest / test runner detection (most specific first)
-    if re.search(r"\bctest\b", cmd):
-        if exit_code == 0:
-            return "SUCCESS"
-        if exit_code is not None:
-            return "FAILED"
-        return "TESTING"
-
-    # Generic test runner in command
-    if re.search(r"\btest\b", cmd) and not re.search(r"-D\w*test", cmd, re.IGNORECASE):
-        if exit_code == 0:
-            return "SUCCESS"
-        if exit_code is not None:
-            return "FAILED"
-        return "TESTING"
-
-    # cmake configure command (cmake -B build ... without --build)
-    if re.search(r"\bcmake\b", cmd) and not re.search(r"--build", cmd):
-        if exit_code == 0:
-            return "CONFIGURING"
-        if exit_code is not None:
-            return "FAILED"
-        return "CONFIGURING"
-
-    # Build command detection
-    if re.search(r"\bcmake\s+--build\b|\bmake\b|\bninja\b|\bmsbuild\b|\bmingw32-make\b", cmd):
-        if exit_code is None:
-            return "BUILDING"
-        return "FAILED" if exit_code != 0 else "BUILDING"
-
-    if exit_code is not None:
-        return "FAILED" if exit_code != 0 else state["status"]
-
-    return state["status"]
-
-
-def _fit_reasoner_messages_to_budget(
-    system: SystemMessage,
-    summary_context: HumanMessage,
-    history: list[BaseMessage],
-    model_name: str,
-    input_budget: int,
-    stagnation_hint: HumanMessage | None = None,
-) -> list[BaseMessage]:
-    """Execute function `_fit_reasoner_messages_to_budget`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        system (SystemMessage): Input value used by this routine.
-        summary_context (HumanMessage): Input value used by this routine.
-        history (list[BaseMessage]): Input value used by this routine.
-        model_name (str): Input value used by this routine.
-        input_budget (int): Input value used by this routine.
-        stagnation_hint (HumanMessage | None): Input value used by this routine.
-
-    Returns:
-        list[BaseMessage]: Result produced by this routine.
-    """
-    summary_text = str(summary_context.content)
-    current_summary = summary_text
-    current_history = list(history)
-
-    while True:
-        candidate_summary = HumanMessage(content=current_summary)
-        candidate_messages = [system, candidate_summary]
-        if stagnation_hint is not None:
-            candidate_messages.append(stagnation_hint)
-        candidate_messages.extend(current_history)
-        tokens = estimate_token_count(candidate_messages, model_name)
-        if tokens <= input_budget:
-            return candidate_messages
-
-        protected_indexes = _important_message_indexes(current_history)
-        pair = _pop_oldest_tool_observation_pair(current_history, protected_indexes)
-        if pair:
-            continue
-        removed = _pop_oldest_non_protected_message(current_history, protected_indexes)
-        if removed is not None:
-            continue
-        if current_history:
-            current_history.pop(0)
-            continue
-
-        target_summary_tokens = max(64, input_budget // 2)
-        current_summary = trim_text_to_token_budget(current_summary, model_name, target_summary_tokens)
-        final_messages: list[BaseMessage] = [system, HumanMessage(content=current_summary)]
-        if stagnation_hint is not None:
-            final_messages.append(stagnation_hint)
-        if estimate_token_count(final_messages, model_name) <= input_budget:
-            return final_messages
-
-
-def _fit_report_messages_to_budget(
-    system: SystemMessage,
-    history: list[BaseMessage],
-    report_request: HumanMessage,
-    model_name: str,
-    input_budget: int,
-) -> list[BaseMessage]:
-    """Execute function `_fit_report_messages_to_budget`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        system (SystemMessage): Input value used by this routine.
-        history (list[BaseMessage]): Input value used by this routine.
-        report_request (HumanMessage): Input value used by this routine.
-        model_name (str): Input value used by this routine.
-        input_budget (int): Input value used by this routine.
-
-    Returns:
-        list[BaseMessage]: Result produced by this routine.
-    """
-    current_history = list(history)
-    while True:
-        candidate = [system, *current_history, report_request]
-        tokens = estimate_token_count(candidate, model_name)
-        if tokens <= input_budget:
-            return candidate
-
-        protected_indexes = _important_message_indexes(current_history)
-        pair = _pop_oldest_tool_observation_pair(current_history, protected_indexes)
-        if pair:
-            continue
-        removed = _pop_oldest_non_protected_message(current_history, protected_indexes)
-        if removed is not None:
-            continue
-        if current_history:
-            current_history.pop(0)
-            continue
-        request_text = trim_text_to_token_budget(str(report_request.content), model_name, max(96, input_budget // 2))
-        return [system, HumanMessage(content=request_text)]
-
-
-def _pop_oldest_tool_observation_pair(
-    messages: list[BaseMessage],
-    protected_indexes: set[int] | None = None,
-) -> list[BaseMessage]:
-    """Execute function `_pop_oldest_tool_observation_pair`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-        protected_indexes (set[int] | None): Input value used by this routine.
-
-    Returns:
-        list[BaseMessage]: Result produced by this routine.
-    """
-    protected = protected_indexes or set()
-
-    ai_index = None
-    pair_indexes: list[int] = []
-
-    for index, message in enumerate(messages):
-        if not (isinstance(message, AIMessage) and getattr(message, "tool_calls", None)):
-            continue
-
-        candidate_indexes = [index]
-        for tool_index in range(index + 1, len(messages)):
-            if isinstance(messages[tool_index], ToolMessage):
-                candidate_indexes.append(tool_index)
-            elif isinstance(messages[tool_index], AIMessage):
-                break
-
-        if any(candidate_index in protected for candidate_index in candidate_indexes):
-            continue
-
-        ai_index = index
-        pair_indexes = candidate_indexes
-        break
-
-    if ai_index is None:
-        return []
-
-    removed: list[BaseMessage] = []
-    for index in sorted(pair_indexes, reverse=True):
-        removed.append(messages.pop(index))
-
-    removed.reverse()
-    return removed
-
-
-def _pop_oldest_non_protected_message(
-    messages: list[BaseMessage],
-    protected_indexes: set[int],
-) -> BaseMessage | None:
-    """Execute function `_pop_oldest_non_protected_message`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-        protected_indexes (set[int]): Input value used by this routine.
-
-    Returns:
-        BaseMessage | None: Result produced by this routine.
-    """
-    for index, _message in enumerate(messages):
-        if index in protected_indexes:
-            continue
-        return messages.pop(index)
-    return None
-
-
-def _important_message_indexes(messages: list[BaseMessage]) -> set[int]:
-    """Execute function `_important_message_indexes`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        set[int]: Result produced by this routine.
-    """
-    important: set[int] = set()
-
-    # Always protect the most recent tool-call context so the model can react
-    important.update(_recent_tool_context_indexes(messages, keep_pairs=2))
-
-    for index, message in enumerate(messages):
-        if not isinstance(message, ToolMessage):
-            continue
-
-        text = str(message.content)
-        if not _is_important_tool_output(text):
-            continue
-
-        important.add(index)
-
-        for prev_index in range(index - 1, -1, -1):
-            prev_message = messages[prev_index]
-            if isinstance(prev_message, AIMessage) and getattr(prev_message, "tool_calls", None):
-                important.add(prev_index)
-                break
-            if isinstance(prev_message, ToolMessage):
-                break
-
-    return important
-
-
-def _recent_tool_context_indexes(messages: list[BaseMessage], keep_pairs: int = 2) -> set[int]:
-    """Execute function `_recent_tool_context_indexes`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-        keep_pairs (int): Input value used by this routine.
-
-    Returns:
-        set[int]: Result produced by this routine.
-    """
-    protected: set[int] = set()
-    remaining = keep_pairs
-
-    for index in range(len(messages) - 1, -1, -1):
-        msg = messages[index]
-        if not isinstance(msg, AIMessage) or not getattr(msg, "tool_calls", None):
-            continue
-
-        protected.add(index)
-        for j in range(index + 1, len(messages)):
-            if isinstance(messages[j], ToolMessage):
-                protected.add(j)
-            elif isinstance(messages[j], AIMessage):
-                break
-
-        remaining -= 1
-        if remaining <= 0:
-            break
-
-    return protected
-
-
-def _build_stagnation_hint(state: AgentState, history: list[BaseMessage]) -> HumanMessage | None:
-    """Execute function `_build_stagnation_hint`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        state (AgentState): Input value used by this routine.
-        history (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        HumanMessage | None: Result produced by this routine.
-    """
-    signatures = _recent_tool_call_signatures(history, window=4)
-    if len(signatures) < 3:
-        signatures = signatures
-
-    # If the same tool-call signature repeats across recent turns, nudge strategy change.
-    if len(set(signatures[-3:])) == 1:
-        repeated = signatures[-1]
-        return HumanMessage(
-            content=(
-                "Stagnation detected: the same tool-call pattern was repeated for 3 consecutive turns "
-                f"({repeated}). Choose a different strategy using new evidence. "
-                "Do not repeat identical discovery calls unless a command failure explicitly requires it. "
-                "Prefer the next unresolved lifecycle step (configure/build/test or failure diagnosis)."
-            )
-        )
-
-    recent_patterns = _recent_tool_name_patterns(history, window=5)
-    if recent_patterns and all("execute_shell_command" not in pattern for pattern in recent_patterns):
-        return HumanMessage(
-            content=(
-                "Stagnation detected: multiple turns used discovery/search tools only and no real command execution. "
-                "Pick a concrete next experiment using execute_shell_command based on current evidence, "
-                "then use its output to update strategy."
-            )
-        )
-
-    # Progress-aware guard: if several shell commands ran but none advanced lifecycle, force pivot.
-    recent_shell_cmds = _recent_shell_commands(history, window=8)
-    if state.get("step_count", 0) >= 3 and recent_shell_cmds:
-        has_lifecycle_cmd = any(_is_lifecycle_command(cmd) for cmd in recent_shell_cmds)
-        if not has_lifecycle_cmd:
-            cmds = " ; ".join(recent_shell_cmds[-4:])
-            return HumanMessage(
-                content=(
-                    "Stagnation detected: recent shell commands did not perform configure/build/test actions. "
-                    f"Recent shell commands: {cmds}. "
-                    "Choose one command that advances lifecycle (configure, build, or test) based on detected build files and tools. "
-                    "Avoid repository metadata commands unless they directly help diagnose a failure."
-                )
-            )
-
-    # If tool usage stays discovery-heavy for too long, request a lifecycle action.
-    if state.get("step_count", 0) >= 6 and recent_patterns:
-        discovery_only = True
-        for pattern in recent_patterns[-4:]:
-            names = [n for n in pattern.split("|") if n]
-            if any(name not in {"list_directory", "search_codebase", "read_file_chunk"} for name in names):
-                discovery_only = False
-                break
-        if discovery_only:
-            return HumanMessage(
-                content=(
-                    "Stagnation detected: last turns were discovery-only. "
-                    "Use current evidence to run a concrete build-system command and evaluate its output."
-                )
-            )
-
-    return None
-
-
-def _recent_tool_call_signatures(history: list[BaseMessage], window: int = 4) -> list[str]:
-    """Execute function `_recent_tool_call_signatures`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        history (list[BaseMessage]): Input value used by this routine.
-        window (int): Input value used by this routine.
-
-    Returns:
-        list[str]: Result produced by this routine.
-    """
-    signatures: list[str] = []
-    for message in history:
-        if not isinstance(message, AIMessage):
-            continue
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if not tool_calls:
-            continue
-
-        parts: list[str] = []
-        for call in tool_calls:
-            name = str(call.get("name", ""))
-            args = call.get("args", {})
-            args_repr = str(args)
-            parts.append(f"{name}:{args_repr}")
-        signatures.append(" | ".join(parts))
-
-    if window <= 0:
-        return signatures
-    return signatures[-window:]
-
-
-def _recent_tool_name_patterns(history: list[BaseMessage], window: int = 5) -> list[str]:
-    """Execute function `_recent_tool_name_patterns`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        history (list[BaseMessage]): Input value used by this routine.
-        window (int): Input value used by this routine.
-
-    Returns:
-        list[str]: Result produced by this routine.
-    """
-    patterns: list[str] = []
-    for message in history:
-        if not isinstance(message, AIMessage):
-            continue
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if not tool_calls:
-            continue
-        names = sorted(str(call.get("name", "")) for call in tool_calls)
-        patterns.append("|".join(names))
-    if window <= 0:
-        return patterns
-    return patterns[-window:]
-
-
-def _recent_shell_commands(history: list[BaseMessage], window: int = 8) -> list[str]:
-    """Execute function `_recent_shell_commands`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        history (list[BaseMessage]): Input value used by this routine.
-        window (int): Input value used by this routine.
-
-    Returns:
-        list[str]: Result produced by this routine.
-    """
-    cmds: list[str] = []
-    for message in history:
-        if not isinstance(message, ToolMessage):
-            continue
-        text = str(message.content)
-        cmd = _extract_cmd(text)
-        if cmd:
-            cmds.append(cmd)
-    if window <= 0:
-        return cmds
-    return cmds[-window:]
-
-
-def _is_lifecycle_command(cmd: str) -> bool:
-    """Execute function `_is_lifecycle_command`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        cmd (str): Input value used by this routine.
-
-    Returns:
-        bool: Result produced by this routine.
-    """
-    lowered = cmd.lower()
-    patterns = [
-        r"\bcmake\b.*\b(-b|-s|--build)\b",
-        r"\bctest\b",
-        r"\bninja\b",
-        r"\bmingw32-make\b",
-        r"\bmake\b",
-        r"\bmeson\b",
-    ]
-    return any(re.search(pattern, lowered) for pattern in patterns)
-
-
-def _is_important_tool_output(text: str) -> bool:
-    """Execute function `_is_important_tool_output`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        bool: Result produced by this routine.
-    """
-    cmd = (_extract_cmd(text) or "").lower()
-    lowered = text.lower()
-
-    # Protect any test runner output
-    if re.search(r"\btest\b", cmd):
-        return True
-
-    # Protect messages containing test results or failure signals
-    signal_patterns = [
-        r"\d+% tests passed",
-        r"\d+ (?:tests?\s+)?passed",
-        r"\d+ (?:tests?\s+)?failed",
-        r"the following tests? failed",
-        r"\*\*\*(timeout|failed)",
-        r"assertion.*(failed|error)",
-        r"\[exit_code\]=[1-9]\d*",
-    ]
-    for pattern in signal_patterns:
-        if re.search(pattern, lowered, flags=re.IGNORECASE):
-            return True
-
-    # Protect successful build outputs
-    if re.search(r"\b(build|compile|make|ninja)\b", cmd) and "[exit_code]=0" in lowered:
-        return True
-
-    return False
-
-
-def _sanitize_tool_message_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Execute function `_sanitize_tool_message_sequence`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        messages (list[BaseMessage]): Input value used by this routine.
-
-    Returns:
-        list[BaseMessage]: Result produced by this routine.
-    """
-    allowed_call_ids: set[str] = set()
-    sanitized: list[BaseMessage] = []
-
-    for message in messages:
-        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-            for tool_call in getattr(message, "tool_calls", []) or []:
-                call_id = str(tool_call.get("id", "")).strip()
-                if call_id:
-                    allowed_call_ids.add(call_id)
-            sanitized.append(message)
-            continue
-
-        if isinstance(message, ToolMessage):
-            call_id = str(getattr(message, "tool_call_id", "") or "").strip()
-            if call_id and call_id in allowed_call_ids:
-                sanitized.append(message)
-            continue
-
-        sanitized.append(message)
-
-    return sanitized
-
-
-def _reasoner_output_budget(config: AgentConfig) -> int:
-    """Execute function `_reasoner_output_budget`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        int: Result produced by this routine.
-    """
-    return max(256, min(700, config.output_token_budget // 2))
-
-
-def _report_output_budget(config: AgentConfig) -> int:
-    """Execute function `_report_output_budget`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        int: Result produced by this routine.
-    """
-    return max(512, config.output_token_budget)
-
-
-def _first_matching_line(text: str, pattern: str) -> str | None:
-    """Execute function `_first_matching_line`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-        pattern (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    regex = re.compile(pattern, flags=re.IGNORECASE)
+def _first_error_line(text: str) -> str | None:
     for line in text.splitlines():
-        if regex.search(line):
+        if re.search(r"\berror\b|\bfatal\b|\bfailed\b", line, flags=re.IGNORECASE):
             return line.strip()
     return None
 
 
-def _extract_cmd(text: str) -> str | None:
-    """Execute function `_extract_cmd`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    line = _first_matching_line(text, r"\[cmd\]=.+")
-    if not line:
-        return None
-    return line.split("=", 1)[1].strip()
-
-
-def _extract_exit_code(text: str) -> int | None:
-    """Execute function `_extract_exit_code`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        int | None: Result produced by this routine.
-    """
-    line = _first_matching_line(text, r"\[exit_code\]\s*=\s*\d+|\[exit_code\]=\d+")
-    if not line:
-        return None
-    match = re.search(r"(\d+)", line)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def _extract_test_summary(text: str) -> str | None:
-    # CTest-style: "N% tests passed, M tests failed out of K"
-    """Execute function `_extract_test_summary`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    total_line = _first_matching_line(text, r"\d+% tests passed, \d+ tests failed out of \d+")
-    if total_line:
-        return total_line
-    # Generic pass/fail summaries
-    pass_line = _first_matching_line(text, r"\d+\s+(?:tests?\s+)?passed")
-    if pass_line:
-        return pass_line
-    fail_line = _first_matching_line(text, r"\d+\s+(?:tests?\s+)?failed")
-    if fail_line:
-        return fail_line
+def _last_ai_message(messages: list[BaseMessage]) -> AIMessage | None:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            return msg
     return None
-
-
-def _extract_build_summary(text: str) -> str | None:
-    """Execute function `_extract_build_summary`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        text (str): Input value used by this routine.
-
-    Returns:
-        str | None: Result produced by this routine.
-    """
-    markers = len(re.findall(r"Built target |\[\d+/\d+\]", text))
-    if markers > 0:
-        return f"Build steps observed: {markers}"
-    return None
-
-
-def _unique_keep_order(items: list[str]) -> list[str]:
-    """Execute function `_unique_keep_order`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        items (list[str]): Input value used by this routine.
-
-    Returns:
-        list[str]: Result produced by this routine.
-    """
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
-
-
-def _build_chat_model(model_name: str, max_tokens: int) -> ChatOpenAI:
-    """Execute function `_build_chat_model`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        model_name (str): Input value used by this routine.
-        max_tokens (int): Input value used by this routine.
-
-    Returns:
-        ChatOpenAI: Result produced by this routine.
-    """
-    kwargs = {
-        "model": model_name,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-    }
-
-    if _is_codex_or_gpt5_model(model_name):
-        try:
-            return ChatOpenAI(**kwargs, use_responses_api=True)
-        except TypeError as exc:
-            raise RuntimeError(
-                "Codex/GPT-5 models require Responses API support in your langchain-openai version. "
-                "Please upgrade langchain-openai and openai packages, then retry."
-            ) from exc
-
-    return ChatOpenAI(**kwargs)
-
-
-def _is_codex_or_gpt5_model(model_name: str) -> bool:
-    """Execute function `_is_codex_or_gpt5_model`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        model_name (str): Input value used by this routine.
-
-    Returns:
-        bool: Result produced by this routine.
-    """
-    lowered = model_name.lower()
-    return "codex" in lowered or lowered.startswith("gpt-5")
-
-
-def _collect_environment_facts(config: AgentConfig) -> str:
-    """Execute function `_collect_environment_facts`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        config (AgentConfig): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    facts: list[str] = []
-    cwd = Path.cwd()
-    repo_name = _repo_name_from_url(config.clone_url)
-    repo_path = config.repo_dir / repo_name
-
-    facts.append(f"cwd={cwd}")
-    facts.append(f"cwd_path_length={len(str(cwd))}")
-    facts.append(f"repo_path={repo_path}")
-    facts.append(f"repo_path_length={len(str(repo_path))}")
-    facts.append(f"os_name={os.name}")
-
-    for cmd, label in [
-        ("python --version", "python"),
-        ("cmake --version", "cmake"),
-        ("g++ --version", "gxx"),
-        ("git --version", "git"),
-        ("git config --get core.longpaths", "git_core_longpaths"),
-    ]:
-        output = _run_quick_command(cmd)
-        if output:
-            facts.append(f"{label}={output}")
-
-    if len(str(repo_path)) > 120:
-        facts.append("path_length_risk=high")
-    else:
-        facts.append("path_length_risk=low")
-
-    return "\n".join(facts)
-
-
-def _run_quick_command(cmd: str) -> str:
-    """Execute function `_run_quick_command`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        cmd (str): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    try:
-        result = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=5)
-    except Exception:
-        return ""
-
-    text = (result.stdout or result.stderr or "").strip()
-    if not text:
-        return ""
-    first_line = text.splitlines()[0].strip()
-    return first_line[:200]
-
-
-def _build_command_evidence_snapshot(state: AgentState) -> str:
-    """Scan retained tool messages for command outputs and build a structured evidence summary."""
-    tool_messages = [msg for msg in state.get("messages", []) if isinstance(msg, ToolMessage)]
-    records: list[str] = []
-
-    for message in tool_messages:
-        text = str(message.content)
-        cmd = _extract_cmd(text)
-        if not cmd:
-            continue
-
-        exit_code = _extract_exit_code(text)
-        test_summary = _extract_test_summary(text)
-        error_line = _first_matching_line(text, r".*\b(error|failed|fatal)\b.*")
-
-        parts = [f"cmd={cmd}"]
-        if exit_code is not None:
-            parts.append(f"exit_code={exit_code}")
-        if test_summary:
-            parts.append(f"test_result={test_summary}")
-        if error_line and (exit_code is None or exit_code != 0):
-            parts.append(f"error={error_line[:160]}")
-        records.append(" | ".join(parts))
-
-    if not records:
-        return "No command output found in retained messages."
-    return "\n".join(records)
-
-
-def _should_force_report_due_to_stagnation(state: AgentState, config: AgentConfig) -> tuple[bool, str]:
-    """Hard-stop repeated lifecycle loops and route to final report when evidence is no longer improving."""
-    if state.get("step_count", 0) < max(8, config.max_steps // 3):
-        return False, ""
-
-    outcomes = _recent_shell_outcomes(state.get("messages", []), window=14)
-    if len(outcomes) < 6:
-        return False, ""
-
-    # 1) Identical failing ctest signature repeated in recent turns.
-    recent_ctest = [entry for entry in outcomes if re.search(r"\bctest\b", entry[0], flags=re.IGNORECASE)]
-    if len(recent_ctest) >= 3:
-        ctest_signatures = [
-            f"{_normalize_cmd_for_signature(cmd)}|{exit_code}|{(test_summary or '').strip()}"
-            for cmd, exit_code, test_summary in recent_ctest
-        ]
-        if len(set(ctest_signatures[-3:])) == 1:
-            signature = ctest_signatures[-1]
-            return True, f"same ctest outcome repeated 3 times ({signature[:180]})"
-
-    # 2) Lifecycle command pattern repeats with low diversity and no success transition.
-    lifecycle = [entry for entry in outcomes if _is_lifecycle_command(entry[0])]
-    if len(lifecycle) >= 8:
-        recent = lifecycle[-8:]
-        recent_cmds = [_normalize_cmd_for_signature(cmd) for cmd, _code, _summary in recent]
-        unique_cmds = set(recent_cmds)
-        has_test_execution = any(re.search(r"\bctest\b", cmd, flags=re.IGNORECASE) for cmd in recent_cmds)
-        nonzero_count = sum(1 for _cmd, code, _summary in recent if code not in (None, 0))
-
-        if has_test_execution and len(unique_cmds) <= 3 and nonzero_count >= 3:
-            return True, (
-                "repeated configure/build/test pattern with recurring non-zero exits "
-                f"(unique_recent_lifecycle_cmds={len(unique_cmds)}, failures={nonzero_count})"
-            )
-
-    return False, ""
-
-
-def _recent_shell_outcomes(history: list[BaseMessage], window: int = 14) -> list[tuple[str, int | None, str | None]]:
-    """Execute function `_recent_shell_outcomes`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        history (list[BaseMessage]): Input value used by this routine.
-        window (int): Input value used by this routine.
-
-    Returns:
-        list[tuple[str, int | None, str | None]]: Result produced by this routine.
-    """
-    outcomes: list[tuple[str, int | None, str | None]] = []
-    for message in history:
-        if not isinstance(message, ToolMessage):
-            continue
-        text = str(message.content)
-        cmd = _extract_cmd(text)
-        if not cmd:
-            continue
-        exit_code = _extract_exit_code(text)
-        test_summary = _extract_test_summary(text)
-        outcomes.append((cmd, exit_code, test_summary))
-
-    if window <= 0:
-        return outcomes
-    return outcomes[-window:]
-
-
-def _normalize_cmd_for_signature(cmd: str) -> str:
-    """Execute function `_normalize_cmd_for_signature`.
-
-    This routine is part of the agent workflow and keeps its existing runtime behavior.
-
-    Args:
-        cmd (str): Input value used by this routine.
-
-    Returns:
-        str: Result produced by this routine.
-    """
-    normalized = re.sub(r"\s+", " ", cmd.strip().lower())
-    normalized = normalized.replace(".\\build", "build")
-    normalized = normalized.replace("--test-dir .\\build", "--test-dir build")
-    return normalized
