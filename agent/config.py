@@ -54,6 +54,12 @@ class AgentConfig:
     use_tool_summarizer: bool = field(
         default_factory=lambda: os.getenv("AGENT_USE_TOOL_SUMMARIZER", "true").lower() == "true"
     )
+    use_conversation_compressor: bool = field(
+        default_factory=lambda: os.getenv("AGENT_USE_CONVERSATION_COMPRESSOR", "true").lower() == "true"
+    )
+    use_multi_hop: bool = field(
+        default_factory=lambda: os.getenv("AGENT_USE_MULTI_HOP", "true").lower() == "true"
+    )
     retrieval_digest_tokens: int = field(
         default_factory=lambda: int(os.getenv("AGENT_RETRIEVAL_DIGEST_TOKENS", "400"))
     )
@@ -68,3 +74,7 @@ class AgentConfig:
             )
         if self.token_budget != 5000:
             raise ValueError("token_budget must remain 5000 per specification")
+        if self.retrieval_digest_tokens >= self.token_budget:
+            raise ValueError("retrieval_digest_tokens must be < token_budget (5000)")
+        if self.tool_summary_tokens >= self.token_budget:
+            raise ValueError("tool_summary_tokens must be < token_budget (5000)")

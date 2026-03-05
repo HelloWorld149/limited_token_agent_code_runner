@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 
 from agent.config import AgentConfig
 from agent.indexer import (
@@ -19,18 +18,22 @@ from agent.indexer import (
     search_index,
 )
 from agent.intent import classify_intent_sync
+from agent.model_utils import build_chat_model, normalize_ai_message
 from agent.prompts import INTENT_PROMPT_MAP
 from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
+from agent.subagents import (
+    conversation_compressor_sync,
+    is_complex_question,
+    multi_hop_decomposer_sync,
+    retrieval_subagent_sync,
+    should_summarize_tool_output,
+    tool_output_summarizer_sync,
+)
 from agent.token_utils import (
     estimate_text_tokens,
     fit_messages_to_budget,
     sanitize_tool_message_sequence,
     trim_text_to_token_budget,
-)
-from agent.subagents import (
-    retrieval_subagent_sync,
-    should_summarize_tool_output,
-    tool_output_summarizer_sync,
 )
 from agent.tools import ALL_TOOLS
 
@@ -83,16 +86,49 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 # ===================================================================
 
 def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Classify user intent (via lightweight LLM) and prepare retrieval context."""
+    """Classify user intent (via lightweight LLM) and prepare retrieval context.
+
+    Also runs the conversation compressor subagent every 3 turns to keep
+    the rolling summary fresh and compact.
+    """
     user_input = state.get("last_user_input", "")
 
     # Classify intent using separate lightweight LLM call (~110 tokens)
     intent = classify_intent_sync(user_input, config.classifier_model)
 
-    return {
+    turn_count = state.get("turn_count", 0) + 1
+    result: dict[str, Any] = {
         "current_intent": intent,
-        "turn_count": state.get("turn_count", 0) + 1,
+        "turn_count": turn_count,
+        "_tool_iteration_count": 0,  # reset tool loop counter each turn
     }
+
+    # --- Conversation Compressor Subagent ---
+    # Every 3 turns, re-compress the summary using a subagent.
+    # This produces a much tighter summary than naive string concatenation.
+    if config.use_conversation_compressor and turn_count > 1 and turn_count % 3 == 0:
+        old_summary = state.get("summary_of_knowledge", "")
+        messages = state.get("messages", [])
+
+        # Collect last few messages as text for the compressor
+        recent_text_parts: list[str] = []
+        for msg in messages[-6:]:  # last ~3 turns (human + AI pairs)
+            role = getattr(msg, "type", "unknown")
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            recent_text_parts.append(f"[{role}]: {content[:300]}")
+        recent_text = "\n".join(recent_text_parts)
+
+        if recent_text.strip():
+            new_summary = conversation_compressor_sync(
+                old_summary=old_summary,
+                recent_messages_text=recent_text,
+                model_name=config.subagent_model,
+                max_input_tokens=3000,
+                max_output_tokens=400,
+            )
+            result["summary_of_knowledge"] = new_summary
+
+    return result
 
 
 # ===================================================================
@@ -219,15 +255,49 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     # ---------------------------------------------------------------
     # Subagent compression: compress raw chunks into dense digest
+    # Uses multi-hop decomposer for complex questions, or simple
+    # retrieval subagent for straightforward ones.
     # ---------------------------------------------------------------
     if config.use_retrieval_subagent and raw_code_chunks:
-        context_text = retrieval_subagent_sync(
-            user_query=user_input,
-            raw_code_chunks=raw_code_chunks,
-            model_name=config.subagent_model,
-            max_input_tokens=3500,
-            max_output_tokens=config.retrieval_digest_tokens,
-        )
+        if config.use_multi_hop and is_complex_question(user_input):
+            # Multi-hop: decompose -> parallel investigate -> merge
+            # Creates an index search helper so each sub-query can find
+            # its own targeted code chunks
+            def _index_search_for_subquery(sub_query: str) -> list[str]:
+                sub_results = search_index(index, sub_query, max_results=5)
+                chunks: list[str] = []
+                for item in sub_results:
+                    rel_path = item.file if isinstance(item, SymbolEntry) else item.path
+                    line = item.line if isinstance(item, SymbolEntry) else 1
+                    fp = ws / rel_path
+                    if not fp.exists() or not fp.is_file():
+                        continue
+                    try:
+                        content = fp.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    lines_list = content.splitlines()
+                    s = max(0, line - 5)
+                    e = min(len(lines_list), line + 40)
+                    chunks.append(f"--- {rel_path} (lines {s+1}-{e}) ---\n" + "\n".join(lines_list[s:e]))
+                return chunks if chunks else raw_code_chunks
+
+            context_text = multi_hop_decomposer_sync(
+                user_query=user_input,
+                raw_code_chunks=raw_code_chunks,
+                index_search_fn=_index_search_for_subquery,
+                model_name=config.subagent_model,
+                max_output_tokens=config.retrieval_digest_tokens,
+            )
+        else:
+            # Simple compression: one retrieval subagent
+            context_text = retrieval_subagent_sync(
+                user_query=user_input,
+                raw_code_chunks=raw_code_chunks,
+                model_name=config.subagent_model,
+                max_input_tokens=3500,
+                max_output_tokens=config.retrieval_digest_tokens,
+            )
     else:
         # No subagent: use raw chunks directly (original behavior)
         context_text = "\n\n".join(raw_code_chunks)
@@ -295,6 +365,8 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
     Returns compressed messages via add_messages reducer to replace originals.
     """
     messages = list(state.get("messages", []))
+    # Increment tool iteration counter
+    iteration_count = state.get("_tool_iteration_count", 0) + 1
 
     # Update build state based on tool output
     build_state = state.get("build_state", BuildState())
@@ -327,7 +399,7 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
                     )
                 )
 
-    result: dict[str, Any] = {"build_state": build_state}
+    result: dict[str, Any] = {"build_state": build_state, "_tool_iteration_count": iteration_count}
     if compressed_messages:
         # Return compressed messages — add_messages reducer will merge by ID
         result["messages"] = compressed_messages
@@ -339,8 +411,14 @@ def handle_tool_result(state: AgentState, config: AgentConfig) -> dict[str, Any]
 # ===================================================================
 
 def continue_or_respond(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """After tool execution, call LLM to either make more tool calls or produce a text response."""
-    return _invoke_llm_with_context(state, config, use_tools=True)
+    """After tool execution, call LLM to either make more tool calls or produce a text response.
+
+    Enforces max_tool_iterations: once the limit is reached, the LLM is
+    invoked without tool bindings so it MUST produce a text response.
+    """
+    iteration_count = state.get("_tool_iteration_count", 0)
+    allow_tools = iteration_count < config.max_tool_iterations
+    return _invoke_llm_with_context(state, config, use_tools=allow_tools)
 
 
 # ===================================================================
@@ -408,21 +486,15 @@ def _invoke_llm_with_context(
 
     output_budget = min(config.output_token_budget, 800)
 
-    # Build model — use Responses API for codex models, chat completions otherwise
-    use_responses = _is_responses_model(config.model_name)
-    model = ChatOpenAI(
-        model=config.model_name,
-        temperature=0,
-        max_tokens=output_budget,
-        **({"use_responses_api": True} if use_responses else {}),
-    )
+    # Build model — use shared build_chat_model which auto-detects Responses API
+    model = build_chat_model(config.model_name, temperature=0, max_tokens=output_budget)
     if use_tools:
         model = model.bind_tools(ALL_TOOLS)
 
     try:
         response = model.invoke(candidate)
         # Normalize content: Responses API may return list-of-blocks instead of str
-        response = _normalize_ai_message(response)
+        response = normalize_ai_message(response)
     except Exception as exc:
         response = AIMessage(
             content=f"LLM error: {type(exc).__name__}: {str(exc)[:200]}. "
@@ -430,47 +502,6 @@ def _invoke_llm_with_context(
         )
 
     return {"messages": [response]}
-
-
-# ===================================================================
-# Model type detection
-# ===================================================================
-
-_RESPONSES_API_PATTERNS = ("codex", "o1", "o3", "o4")
-_CHAT_ONLY_PREFIXES = ("gpt-4o", "gpt-4-", "gpt-3.5")
-
-
-def _is_responses_model(model_name: str) -> bool:
-    """Return True if the model should use the Responses API.
-
-    Codex and reasoning models (o1/o3/o4) use the Responses API.
-    Standard chat models (gpt-4o, gpt-3.5) use the chat completions API.
-    """
-    name_lower = model_name.lower()
-    # Explicitly chat-only models first
-    if any(name_lower.startswith(p) for p in _CHAT_ONLY_PREFIXES):
-        return False
-    return any(p in name_lower for p in _RESPONSES_API_PATTERNS)
-
-
-def _normalize_ai_message(msg: AIMessage) -> AIMessage:
-    """Normalize AIMessage content from list-of-blocks (Responses API) to str."""
-    content = msg.content
-    if isinstance(content, list):
-        text_parts = []
-        for block in content:
-            if isinstance(block, dict):
-                text_parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                text_parts.append(block)
-        content = "\n".join(p for p in text_parts if p)
-    if not isinstance(content, str):
-        content = str(content)
-    return AIMessage(
-        content=content,
-        tool_calls=msg.tool_calls if msg.tool_calls else [],
-        id=msg.id,
-    )
 
 
 # ===================================================================

@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
+from agent.model_utils import build_chat_model, extract_text, run_async
 from agent.state import Intent
+from agent.token_utils import trim_text_to_token_budget
 
 
 _CLASSIFIER_SYSTEM = (
@@ -31,18 +32,17 @@ async def classify_intent_async(
     This runs as a separate async task concurrently with context preparation.
     It does NOT consume main 5000-token budget.
     """
-    model = ChatOpenAI(
-        model=model_name,
-        temperature=0,
-        max_tokens=10,
-    )
+    # Trim input — classifier only needs intent, not the full question (~200 tokens max)
+    user_input = trim_text_to_token_budget(user_input, model_name, 200)
+
+    model = build_chat_model(model_name, temperature=0, max_tokens=10)
     messages = [
         SystemMessage(content=_CLASSIFIER_SYSTEM),
         HumanMessage(content=user_input),
     ]
     try:
         response = await model.ainvoke(messages)
-        raw = response.content.strip().upper()
+        raw = extract_text(response.content).upper()
         # Parse — take first valid intent word found
         for token in raw.split():
             cleaned = token.strip(".:,;!\"'")
@@ -59,21 +59,7 @@ def classify_intent_sync(
     model_name: str = "gpt-4o-mini",
 ) -> Intent:
     """Synchronous wrapper for intent classification."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Already in an async context -- schedule as a task
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(
-                    asyncio.run,
-                    classify_intent_async(user_input, model_name),
-                ).result(timeout=15)
-        return loop.run_until_complete(
-            classify_intent_async(user_input, model_name)
-        )
-    except RuntimeError:
-        return asyncio.run(classify_intent_async(user_input, model_name))
+    return run_async(classify_intent_async(user_input, model_name))
 
 
 def _fallback_classify(user_input: str) -> Intent:

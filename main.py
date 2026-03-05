@@ -45,6 +45,7 @@ def main() -> None:
         "turn_count": 0,
         "last_user_input": "",
         "_retrieved_context": "",
+        "_tool_iteration_count": 0,
     }
 
     try:
