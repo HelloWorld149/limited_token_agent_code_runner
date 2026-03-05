@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "turn_graph": "./agent/graph.py:turn_graph",
+    "init_graph": "./agent/graph.py:init_graph"
+  },
+  "env": ".env"
+}

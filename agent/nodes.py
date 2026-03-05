@@ -99,11 +99,16 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
     previous_intent = state.get("current_intent", "QUESTION")
     messages = state.get("messages", [])
 
+    # Defensive: if previous intent was EXIT the session should have ended.
+    # If we're still here the classification was wrong — don't let it cascade.
+    if previous_intent == "EXIT":
+        previous_intent = "QUESTION"
+
     # Classify intent using separate lightweight LLM call (~110 tokens)
     raw_intent = classify_intent_sync(user_input, config.classifier_model)
     intent = raw_intent
 
-    if previous_intent in {"COMPILE", "RUN", "EXPLORE"} and _is_ambiguous_followup(user_input, raw_intent):
+    if _is_ambiguous_followup(user_input, raw_intent):
         last_ai_text = _last_ai_text(messages)
         followup = classify_followup_sync(
             user_input=user_input,
@@ -522,6 +527,20 @@ def route_by_intent(state: AgentState) -> str:
     return "answer_question"
 
 
+# ===================================================================
+# Node: handle_exit — inject a farewell message so display isn't stale
+# ===================================================================
+
+def handle_exit(state: AgentState, config: AgentConfig) -> dict[str, Any]:
+    """Produce a short farewell AIMessage before the graph terminates.
+
+    Without this, routing to END on EXIT would leave no new AIMessage in
+    state, causing ``_display_response`` in main.py to replay the *previous*
+    turn's answer — confusing the user.
+    """
+    return {"messages": [AIMessage(content="Goodbye!")]}
+
+
 def route_after_llm(state: AgentState) -> str:
     """Check if the LLM wants to call tools or has produced a final text response."""
     messages = state.get("messages", [])
@@ -756,15 +775,48 @@ def _last_ai_text(messages: list[BaseMessage]) -> str:
     return str(content)
 
 
+# Unambiguous exit phrases — only skip the followup classifier when the
+# user's text is an obvious exit command that no context could override.
+_HARD_EXIT_PHRASES: set[str] = {"exit", "quit", "bye", "goodbye", "done", "q"}
+
+
 def _is_ambiguous_followup(user_input: str, raw_intent: str) -> bool:
+    """Decide whether a message needs the follow-up classifier.
+
+    The main intent classifier sees *only* the user text — no conversation
+    history.  That means short confirmations like ``yes please``,
+    ``please do it!``, or ``go ahead`` are routinely misclassified as EXIT
+    or QUESTION.  The follow-up classifier is cheap (gpt-4o-mini, ~110
+    tokens) and *does* see the last assistant message, so we should invoke
+    it whenever there is reasonable doubt.
+
+    Rules:
+    1. Empty text → not ambiguous.
+    2. Text is a hard-coded exit phrase ("exit", "quit", …) → trust it.
+    3. Short messages (≤ 8 words) → always ambiguous.  The main classifier
+       simply doesn't have enough signal to be reliable on these.
+    4. Longer messages classified as QUESTION → ambiguous (user might be
+       elaborating on a previous action the assistant offered).
+    5. Everything else → not ambiguous.
+    """
     text = user_input.strip()
     if not text:
         return False
-    if raw_intent == "EXIT":
+
+    # Hard exit phrases — trust them regardless of length.
+    normalised = re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
+    if normalised in _HARD_EXIT_PHRASES:
         return False
+
+    # Short messages are inherently ambiguous without conversation context.
+    if len(text.split()) <= 8:
+        return True
+
+    # Longer messages classified as QUESTION could still be follow-ups.
     if raw_intent == "QUESTION":
         return True
-    return len(text.split()) <= 4
+
+    return False
 
 
 __all__ = [

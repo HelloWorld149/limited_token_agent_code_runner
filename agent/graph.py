@@ -110,3 +110,13 @@ def build_turn_graph(config: AgentConfig):
     graph.add_edge("handle_tool_result", "continue_or_respond")
 
     return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# Module-level compiled graphs for `langgraph dev` / LangGraph Studio.
+# langgraph.json points to these variables.
+# ---------------------------------------------------------------------------
+_default_config = AgentConfig()
+
+turn_graph = build_turn_graph(_default_config)
+init_graph = build_init_graph(_default_config)
