@@ -8,6 +8,29 @@ from typing import Iterable
 
 from langchain_core.tools import tool
 
+from agent.indexer import SKIP_DIRS, SKIP_EXTENSIONS
+
+
+# ---------------------------------------------------------------------------
+# Workspace root — set explicitly via set_workspace_root() at startup.
+# Avoids dependency on os.chdir() / Path.cwd() which can break if the
+# working directory is changed externally.
+# ---------------------------------------------------------------------------
+_workspace_root: Path | None = None
+
+
+def set_workspace_root(path: Path) -> None:
+    """Set the workspace root used by search_codebase and other tools."""
+    global _workspace_root
+    _workspace_root = path.resolve()
+
+
+def get_workspace_root() -> Path:
+    """Return the workspace root, falling back to cwd if not set explicitly."""
+    if _workspace_root is not None:
+        return _workspace_root
+    return Path.cwd()
+
 
 # ---------------------------------------------------------------------------
 # Critical output patterns to preserve during truncation
@@ -199,19 +222,19 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
 
 
 def _iter_text_files(root: Path, include_build: bool = False) -> Iterable[Path]:
-    """Iterate text files under root, skipping binaries and non-essential dirs."""
-    excluded_dirs = {".git", "dist", "out", "node_modules", "__pycache__"}
-    if not include_build:
-        excluded_dirs.update({"build", "build-mingw", "build-ninja"})
+    """Iterate text files under root, skipping binaries and non-essential dirs.
+
+    Uses the shared SKIP_DIRS and SKIP_EXTENSIONS from indexer.py to stay consistent.
+    """
+    excluded_dirs = set(SKIP_DIRS)
+    if include_build:
+        excluded_dirs -= {"build", "build-mingw", "build-ninja"}
     for path in root.rglob("*"):
         if path.is_dir():
             continue
         if any(part in excluded_dirs for part in path.parts):
             continue
-        if path.suffix.lower() in {
-            ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip",
-            ".exe", ".dll", ".o", ".obj", ".a", ".so",
-        }:
+        if path.suffix.lower() in SKIP_EXTENSIONS:
             continue
         yield path
 
@@ -224,7 +247,7 @@ def search_codebase(regex_pattern: str) -> str:
     except re.error as exc:
         return f"invalid regex: {exc}"
 
-    root = Path.cwd()
+    root = get_workspace_root()
     matches: list[str] = []
     max_matches = 60
 

@@ -4,6 +4,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,7 @@ from agent.token_utils import (
     sanitize_tool_message_sequence,
     trim_text_to_token_budget,
 )
-from agent.tools import ALL_TOOLS
+from agent.tools import ALL_TOOLS, set_workspace_root
 
 
 # ===================================================================
@@ -58,6 +59,9 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     # Change working directory to the workspace
     os.chdir(ws)
+
+    # Set the workspace root explicitly for tools (avoids Path.cwd() dependency)
+    set_workspace_root(ws)
 
     # Build index (use resolved absolute path)
     index = build_codebase_index(ws)
@@ -541,13 +545,14 @@ def _invoke_llm_with_context(
     system_text = INTENT_PROMPT_MAP.get(intent, INTENT_PROMPT_MAP["QUESTION"])
     system = SystemMessage(content=system_text)
 
-    # Build summary context message
+    # Build summary context message (SystemMessage is semantically correct —
+    # this is injected context, not user input)
     summary = state.get("summary_of_knowledge", "")
     retrieved = state.get("_retrieved_context", "")
     summary_content = f"Knowledge: {summary}"
     if retrieved:
         summary_content += f"\n\nRetrieved code:\n{retrieved}"
-    summary_msg = HumanMessage(content=summary_content)
+    summary_msg = SystemMessage(content=summary_content)
 
     # Conversation history
     history = list(state.get("messages", []))
@@ -563,7 +568,8 @@ def _invoke_llm_with_context(
     candidate = fit_messages_to_budget(candidate, config.model_name, effective_budget)
     candidate = sanitize_tool_message_sequence(candidate)
 
-    output_budget = min(config.output_token_budget, 800)
+    # Use the effective output budget from config (caps at 800 for headroom)
+    output_budget = config.effective_output_budget
 
     # Build model — use shared build_chat_model which auto-detects Responses API
     model = build_chat_model(config.model_name, temperature=0, max_tokens=output_budget)
@@ -589,8 +595,6 @@ def _invoke_llm_with_context(
 
 def _probe_environment(workspace_path: Path) -> list[str]:
     """Detect OS, build tools, and recommended cmake generator."""
-    import subprocess
-
     facts: list[str] = []
     facts.append(f"os={platform.system()}")
 
@@ -643,7 +647,10 @@ def _probe_environment(workspace_path: Path) -> list[str]:
 def _update_build_state(
     messages: list[BaseMessage], current: BuildState
 ) -> BuildState:
-    """Update build state based on recent tool outputs."""
+    """Update build state based on recent tool outputs.
+
+    Returns a new frozen BuildState instance (never mutates the input).
+    """
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
             continue
@@ -655,42 +662,48 @@ def _update_build_state(
         exit_code = _extract_exit_code(text)
         cmd_lower = cmd.lower()
 
-        new_state = BuildState(
-            status=current.status,
-            configured=current.configured,
-            built=current.built,
-            tested=current.tested,
-            last_exit_code=exit_code,
-            last_error=current.last_error,
-            consecutive_errors=current.consecutive_errors,
-        )
+        # Start with inherited values
+        status = current.status
+        configured = current.configured
+        built = current.built
+        tested = current.tested
+        last_error = current.last_error
+        consecutive_errors = current.consecutive_errors
 
         if exit_code is not None and exit_code != 0:
             error_line = _first_error_line(text) or f"exit code {exit_code}"
-            new_state.status = "FAILED"
-            new_state.last_error = error_line[:200]
-            new_state.consecutive_errors = current.consecutive_errors + 1
+            status = "FAILED"
+            last_error = error_line[:200]
+            consecutive_errors = current.consecutive_errors + 1
         else:
-            new_state.consecutive_errors = 0
-            new_state.last_error = ""
+            consecutive_errors = 0
+            last_error = ""
 
         # Detect lifecycle stage
         if re.search(r"\bcmake\b", cmd_lower) and "--build" not in cmd_lower:
             if exit_code == 0:
-                new_state.configured = True
-                new_state.status = "CONFIGURING"
+                configured = True
+                status = "CONFIGURING"
         elif re.search(r"--build|\bmake\b|\bninja\b|\bmingw32-make\b", cmd_lower):
             if exit_code == 0:
-                new_state.built = True
-                new_state.status = "BUILDING"
+                built = True
+                status = "BUILDING"
         elif re.search(r"\bctest\b|\btest\b", cmd_lower):
             if exit_code == 0:
-                new_state.tested = True
-                new_state.status = "SUCCESS"
+                tested = True
+                status = "SUCCESS"
             elif exit_code is not None:
-                new_state.status = "FAILED"
+                status = "FAILED"
 
-        return new_state
+        return BuildState(
+            status=status,
+            configured=configured,
+            built=built,
+            tested=tested,
+            last_exit_code=exit_code,
+            last_error=last_error,
+            consecutive_errors=consecutive_errors,
+        )
     return current
 
 
@@ -747,6 +760,23 @@ def _is_ambiguous_followup(user_input: str, raw_intent: str) -> bool:
     text = user_input.strip()
     if not text:
         return False
-    if raw_intent in {"QUESTION", "EXIT"}:
+    if raw_intent == "EXIT":
+        return False
+    if raw_intent == "QUESTION":
         return True
     return len(text.split()) <= 4
+
+
+__all__ = [
+    "index_workspace",
+    "classify_and_prepare",
+    "retrieve_context",
+    "answer_question",
+    "run_build",
+    "run_tests",
+    "explore_codebase",
+    "handle_tool_result",
+    "continue_or_respond",
+    "route_by_intent",
+    "route_after_llm",
+]

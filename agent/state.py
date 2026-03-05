@@ -20,9 +20,9 @@ BuildStatus = Literal[
 ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class BuildState:
-    """Mutable record tracking build lifecycle across turns."""
+    """Immutable record tracking build lifecycle across turns."""
 
     status: BuildStatus = "IDLE"
     configured: bool = False

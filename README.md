@@ -1,49 +1,52 @@
-# Context-Constrained LangGraph Build Agent
+# Context-Constrained AI Codebase Assistant
 
-ReAct-style build/test agent that clones a target repository, explores it, runs configure/build/test commands, and produces a final evidence-based report while operating under a strict 5000-token budget.
+A human-interactive AI coding assistant built with **LangGraph** that helps users understand, build, and test the **nlohmann/json** C++ library while operating under a strict **5000-token LLM context limit**.
 
-## What this project does
+## What This Project Does
 
-- Clones a repository (default: `https://github.com/nlohmann/json`) into `workspace/<repo-name>`
-- Detects local environment/tooling before reasoning (OS, cmake, g++, MSVC, ninja, make, mingw32-make)
-- Uses LangGraph looped reasoning with tool calls to discover, build, test, and diagnose failures
-- Prunes chat history when over budget and preserves key findings as summary breadcrumbs
-- Generates a final report from retained command evidence (with local fallback if LLM report generation fails)
+- Works with a **pre-downloaded** local copy of [nlohmann/json](https://github.com/nlohmann/json) at `workspace/json/`
+- Runs as a **conversational REPL** — ask questions, request builds, run tests interactively
+- Classifies user intent (question, build, test, explore) via a lightweight parallel LLM call
+- Retrieves relevant code context using a **three-layer pipeline**: path-aware direct load → keyword/symbol search → ReAct tool fallback
+- Compresses code and tool outputs via **sub-agent LLM calls** to fit within the token budget
+- Executes actual build/test commands locally (`cmake`, `ninja`, `ctest`) and interprets results
+- Maintains a rolling conversation summary across turns — never loses context
 
-## Current architecture at a glance
+## Architecture at a Glance
 
 ```
-START
-  |
-  v
-initialize_workspace
-  |
-  v
-agent_reasoner --(tool calls)--> execute_tools --> context_manager --+
-      |                                                     |
-      +------------------(no tool / step limit)------------+
-                                |
-                                v
-                          generate_report --> END
+Startup:  START → index_workspace → END
+
+Per-turn:
+  START → classify_and_prepare → retrieve_context → route_by_intent:
+    ├── answer_question  ──┐
+    ├── run_build        ──┤── route_after_llm ──→ execute_tools → handle_tool_result
+    ├── run_tests        ──┤                         → continue_or_respond (loop)
+    ├── explore_codebase ──┘
+    └── exit → END
+
+Sub-agents (separate LLM calls, outside main budget):
+    ├── Retrieval Compressor  (code → dense digest)
+    ├── Tool Output Summarizer (build logs → compact summary)
+    ├── Conversation Compressor (rolling summary refresh)
+    └── Multi-Hop Decomposer  (complex questions → parallel investigate → merge)
 ```
 
-ReAct cycle: `agent_reasoner -> execute_tools -> context_manager -> agent_reasoner`.
+## Key Implementation Details
 
-## Key implementation details
-
-- Hard budget invariant enforced in config: `token_budget == 5000` and `input + output <= total`
-- Default budgets: input 4000, output 1000, prune threshold 4000
-- Reasoner output budget is capped to <=700 tokens; report can use up to output budget
-- Failure handling is reflective (single reconsideration pass) rather than forced command injection
-- Context pruning protects important tool outputs (test summaries, failures, recent tool-call context)
-- Command output truncation keeps head/tail plus critical lines (CTest/CMake/error signals)
+- **Hard 5000-token budget**: enforced programmatically — includes system prompt, context, history, tool schemas, and output
+- Default budgets: input 4000, output 1000 (capped to 800 in practice)
+- All intents use a **ReAct tool loop** (max 3 iterations) — the LLM can read files, list directories, search code, and run shell commands
+- Sub-agents expand effective capacity to ~20,000+ tokens per turn across multiple independent LLM calls
+- Token counting via `tiktoken`; pruning drops oldest tool-call/observation pairs first
+- Smart output truncation preserves critical lines (errors, test summaries, CTest counts)
+- Windows-compatible: command normalization, environment probing, path handling
 
 ## Prerequisites
 
 - Python 3.10+
-- `OPENAI_API_KEY` configured
-- `git`
-- Build tooling appropriate for your target project (`cmake` and at least one build backend)
+- `OPENAI_API_KEY` environment variable set
+- Build tooling: `cmake` and at least one backend (`ninja`, `make`, or `mingw32-make`)
 
 ## Installation
 
@@ -53,70 +56,83 @@ cd limited_token_agent_code_runner
 pip install -r requirements.txt
 ```
 
-PowerShell:
+## Configuration
 
-```powershell
-$env:OPENAI_API_KEY="<your-key>"
+Set your API key and optionally configure via `.env` or environment variables:
+
+```bash
+# Unix/macOS
+export OPENAI_API_KEY=sk-...
+
+# Windows PowerShell
+$env:OPENAI_API_KEY="sk-..."
 ```
 
-## Usage
+Key environment variables (see `agent/config.py` for all options):
 
-Basic run:
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_MODEL` | `gpt-5.3-codex` | Main reasoning model |
+| `AGENT_CLASSIFIER_MODEL` | `gpt-4o-mini` | Intent classifier model |
+| `AGENT_SUBAGENT_MODEL` | `gpt-5.3-codex` | Sub-agent model |
+| `AGENT_WORKSPACE_PATH` | `workspace/json` | Path to nlohmann/json codebase |
+| `AGENT_MAX_TOOL_ITERATIONS` | `3` | Max ReAct tool loop iterations per turn |
+| `AGENT_USE_RETRIEVAL_SUBAGENT` | `true` | Enable retrieval compression sub-agent |
+| `AGENT_USE_MULTI_HOP` | `true` | Enable multi-hop decomposition |
+
+Note: the default `AGENT_MODEL` is tuned for this assignment setup; if unavailable in your account, override it in `.env` (for example: `AGENT_MODEL=gpt-4o-mini`).
+
+## Usage
 
 ```bash
 python main.py
 ```
 
-Verbose stream with logging:
+Interactive commands:
+- Ask questions about code: `"What does json.hpp do?"`, `"Explain the parser architecture"`
+- Build: `"build the project"`, `"compile with ninja"`
+- Test: `"run the tests"`, `"run ctest"`
+- Explore: `"list the src directory"`, `"search for parse functions"`
+- Exit: `"exit"`, `"quit"`, `"bye"`
 
-```bash
-python main.py --verbose-loop --log-file logs/run.log
-```
-
-Common options:
-
-```bash
-python main.py \
-  --model gpt-5.3-codex \
-  --max-steps 25 \
-  --repo-dir workspace \
-  --clone-url https://github.com/nlohmann/json \
-  --verbose-loop \
-  --log-file logs/run.log
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--model` | `gpt-5.3-codex` | LLM model name |
-| `--max-steps` | `25` | Maximum reasoning loops |
-| `--repo-dir` | `workspace` | Parent directory for cloning |
-| `--clone-url` | `https://github.com/nlohmann/json` | Target repository URL |
-| `--verbose-loop` | `false` | Stream per-node updates |
-| `--log-file` | `""` | Optional log file path |
-
-Environment variable overrides are supported via `AGENT_*` settings in `agent/config.py`.
-
-## Project structure
+## Project Structure
 
 ```
-main.py
+main.py                 # REPL entry point — input loop, graph invocation, output display
 agent/
-  config.py
-  graph.py
-  nodes.py
-  prompts.py
-  state.py
-  token_utils.py
-  tools.py
-ARCHITECTURE.md
+  __init__.py           # Package exports
+  config.py             # AgentConfig — immutable settings with env var overrides
+  state.py              # AgentState, BuildState, FileEntry, SymbolEntry, CodebaseIndex
+  graph.py              # LangGraph StateGraph definitions (init + per-turn)
+  nodes.py              # Graph node functions, routers, LLM invocation, helpers
+  intent.py             # Intent classifier (async LLM + keyword fallback) + follow-up classifier
+  indexer.py            # Codebase indexer (file manifest, symbols, purpose map, search)
+  tools.py              # LangChain tools: shell, read_file_chunk, list_directory, search_codebase
+  prompts.py            # Intent-specific system prompts
+  subagents.py          # Sub-agent modules (retrieval, tool summarizer, compressor, multi-hop)
+  model_utils.py        # Model detection, ChatOpenAI construction, response normalization
+  token_utils.py        # Token counting, trimming, budget fitting, message sanitization
+DOCUMENTATION.md        # Comprehensive technical reference (architecture, data flow, module docs)
 README.md
 requirements.txt
-workspace/            # runtime clone location (contains target repo, e.g. workspace/json)
+workspace/json/         # Pre-downloaded nlohmann/json codebase (not agent source)
 logs/
 ```
 
+## Design Document
+
+See [DOCUMENTATION.md](DOCUMENTATION.md) for the complete architecture walkthrough, including:
+- Module-by-module reference
+- Data flow diagrams
+- Token budget deep dive
+- Three-layer retrieval pipeline
+- Sub-agent architecture
+- Build state machine
+- Configuration reference
+
 ## Notes
 
-- This agent is designed to inspect/build/test target repositories and report findings; it should not edit target source code.
-- `workspace/json` is a runtime clone destination for the default target and not required as committed source for the Python agent itself.
-- For exact node-by-node behavior, see `ARCHITECTURE.md`.
+- The agent operates **exclusively** on the pre-downloaded `workspace/json/` — it never clones or downloads repositories.
+- Commands are executed locally via `subprocess` — never simulated.
+- The agent reads, builds, and tests — it **never modifies** the target project's source code.
+- The 5000-token limit is enforced programmatically per LLM call. Sub-agents are separate calls with their own 5000-token caps.

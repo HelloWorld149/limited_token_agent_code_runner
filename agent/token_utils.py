@@ -35,16 +35,27 @@ def estimate_text_tokens(text: str, model_name: str) -> int:
 
 
 def trim_text_to_token_budget(text: str, model_name: str, max_tokens: int) -> str:
-    """Trim text to fit within a token budget using binary-ish shrink."""
+    """Trim text to fit within a token budget using binary search over character positions.
+
+    O(log n) binary search instead of the previous iterative 80%-shrink approach,
+    which was O(n log n). More efficient for very large texts.
+    """
     if max_tokens <= 0:
         return ""
     if estimate_text_tokens(text, model_name) <= max_tokens:
         return text
-    # Binary-ish reduction
-    reduced = text
-    while estimate_text_tokens(reduced, model_name) > max_tokens and len(reduced) > 32:
-        reduced = reduced[: int(len(reduced) * 0.8)]
-    return reduced
+
+    # Binary search for the longest prefix that fits within max_tokens
+    lo, hi = 0, len(text)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if estimate_text_tokens(text[:mid], model_name) <= max_tokens:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return text[:best]
 
 
 def fit_messages_to_budget(
@@ -60,8 +71,11 @@ def fit_messages_to_budget(
     return current
 
 
-def _pop_oldest_tool_observation_pair(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Remove the oldest AI(tool_calls) + ToolMessage(s) pair."""
+def _pop_oldest_tool_observation_pair(messages: list[BaseMessage]) -> bool:
+    """Remove the oldest AI(tool_calls) + ToolMessage(s) pair.
+
+    Returns True when a pair was removed, False otherwise.
+    """
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             # Collect following ToolMessages
@@ -71,12 +85,10 @@ def _pop_oldest_tool_observation_pair(messages: list[BaseMessage]) -> list[BaseM
                     indexes.append(j)
                 else:
                     break
-            removed = []
             for idx in sorted(indexes, reverse=True):
-                removed.append(messages.pop(idx))
-            removed.reverse()
-            return removed
-    return []
+                messages.pop(idx)
+            return True
+    return False
 
 
 def sanitize_tool_message_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:

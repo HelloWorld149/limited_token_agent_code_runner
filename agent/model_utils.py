@@ -11,6 +11,7 @@ This is the SINGLE SOURCE OF TRUTH for:
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -21,8 +22,24 @@ from langchain_openai import ChatOpenAI
 # Model type detection (Responses API vs Chat Completions)
 # ---------------------------------------------------------------------------
 
-_RESPONSES_API_PATTERNS = ("codex", "o1", "o3", "o4")
-_CHAT_ONLY_PREFIXES = ("gpt-4o", "gpt-4-", "gpt-3.5")
+# Regex patterns for models that use the Responses API.
+# Using compiled regexes instead of simple substring matching so we can handle
+# versioned model names (e.g. "o3-mini-2025-01-31") and future naming changes.
+_RESPONSES_API_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"\bcodex\b", re.IGNORECASE),          # codex family
+    re.compile(r"\bo[134]\b", re.IGNORECASE),          # o1, o3, o4 reasoning models
+    re.compile(r"\bo[134]-", re.IGNORECASE),            # o1-mini, o3-mini-2025-01-31, etc.
+    re.compile(r"\bo[134]p\b", re.IGNORECASE),          # o1p, o3p, o4p (preview variants)
+]
+
+# Explicit chat completions models — checked FIRST so they are never
+# accidentally matched by a Responses API pattern.
+_CHAT_ONLY_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"^gpt-4o", re.IGNORECASE),             # gpt-4o, gpt-4o-mini
+    re.compile(r"^gpt-4-", re.IGNORECASE),             # gpt-4-turbo, gpt-4-0613 …
+    re.compile(r"^gpt-3\.5", re.IGNORECASE),           # gpt-3.5-turbo …
+    re.compile(r"^gpt-4\b", re.IGNORECASE),            # gpt-4 (exact)
+]
 
 
 def is_responses_model(model_name: str) -> bool:
@@ -30,11 +47,16 @@ def is_responses_model(model_name: str) -> bool:
 
     Codex and reasoning models (o1/o3/o4) use the Responses API.
     Standard chat models (gpt-4o, gpt-3.5) use the chat completions API.
+
+    This function uses compiled regex patterns instead of simple substring
+    matching so it handles versioned suffixes and future naming changes
+    without needing constant updates.
     """
-    name_lower = model_name.lower()
-    if any(name_lower.startswith(p) for p in _CHAT_ONLY_PREFIXES):
+    name = model_name.strip()
+    # Chat-only models take priority
+    if any(p.search(name) for p in _CHAT_ONLY_REGEXES):
         return False
-    return any(p in name_lower for p in _RESPONSES_API_PATTERNS)
+    return any(p.search(name) for p in _RESPONSES_API_REGEXES)
 
 
 # ---------------------------------------------------------------------------

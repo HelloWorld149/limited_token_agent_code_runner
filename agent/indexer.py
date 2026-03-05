@@ -32,7 +32,8 @@ _LANG_MAP: dict[str, str] = {
     ".bzl": "bazel",
 }
 
-_SKIP_DIRS = {
+
+SKIP_DIRS = {
     ".git",
     "build",
     "build-mingw",
@@ -44,7 +45,7 @@ _SKIP_DIRS = {
     "out",
 }
 
-_SKIP_EXTENSIONS = {
+SKIP_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip",
     ".exe", ".dll", ".o", ".obj", ".a", ".so", ".dylib",
     ".woff", ".woff2", ".ttf", ".eot", ".ico",
@@ -89,14 +90,14 @@ def build_codebase_index(workspace_path: Path) -> CodebaseIndex:
         # Prune skipped directories in-place
         dirnames[:] = [
             d for d in dirnames
-            if d not in _SKIP_DIRS
+            if d not in SKIP_DIRS
         ]
 
         for filename in filenames:
             filepath = Path(dirpath) / filename
             ext = filepath.suffix.lower()
 
-            if ext in _SKIP_EXTENSIONS:
+            if ext in SKIP_EXTENSIONS:
                 continue
 
             try:
