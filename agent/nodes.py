@@ -13,14 +13,17 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolM
 from agent.config import AgentConfig
 from agent.indexer import (
     build_codebase_index,
+    configure_background_reindexing,
     detect_directory_references,
     detect_file_references,
     expand_chunk_window,
     format_file_outline,
     format_file_manifest_summary,
+    get_live_codebase_index,
     get_file_chunks,
     search_chunks,
     search_index,
+    stop_background_reindexing,
 )
 from agent.intent import classify_intent_sync
 from agent.model_utils import build_chat_model, normalize_ai_message
@@ -73,10 +76,35 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         ws,
         use_persistent_cache=config.index_cache_enabled,
         cache_directory=config.cache_directory,
+        use_embedding_retrieval=config.use_embedding_retrieval,
+        embedding_provider=config.embedding_provider,
+        embedding_model=config.embedding_model,
+        embedding_dimensions=config.embedding_dimensions,
+    )
+    configure_background_reindexing(
+        workspace_path=ws,
+        initial_index=index,
+        enabled=config.background_reindex_enabled,
+        interval_seconds=config.background_reindex_interval_seconds,
+        use_persistent_cache=config.index_cache_enabled,
+        cache_directory=config.cache_directory,
+        use_embedding_retrieval=config.use_embedding_retrieval,
+        embedding_provider=config.embedding_provider,
+        embedding_model=config.embedding_model,
+        embedding_dimensions=config.embedding_dimensions,
     )
 
     # Detect environment
     env_facts = _probe_environment(ws)
+    env_facts.append(f"retrieval_embeddings={index.embedding_backend}")
+    env_facts.append(
+        "background_reindex="
+        + (
+            f"enabled:{config.background_reindex_interval_seconds:.0f}s"
+            if config.background_reindex_enabled
+            else "disabled"
+        )
+    )
 
     summary = (
         f"Workspace: {ws.resolve()} | "
@@ -186,12 +214,20 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     that span section boundaries.
     """
     user_input = state.get("last_user_input", "")
-    index = state.get("codebase_index", CodebaseIndex())
+    original_index = state.get("codebase_index", CodebaseIndex())
+    index = get_live_codebase_index(config.workspace_path, original_index)
 
     raw_code_chunks: list[str] = []
     debug_logs = list(state.get("_turn_debug_logs", []))
     turn_subagent_count = int(state.get("_turn_subagent_count", 0))
     file_lookup = {file_entry.path: file_entry for file_entry in index.files}
+
+    index_updated = index.indexed_at_ns > 0 and index.indexed_at_ns != original_index.indexed_at_ns
+    if index_updated:
+        debug_logs.append(
+            "background_reindex.refresh "
+            f"chunks={len(index.chunks)} indexed_at_ns={index.indexed_at_ns}"
+        )
 
     if config.use_retrieval_subagent:
         token_budget_for_raw = 3000
@@ -230,7 +266,13 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     direct_seed_chunks: list[ChunkEntry] = []
     for file_entry in direct_files[:4]:
-        local_hits = search_chunks(index, user_input, max_results=2, allowed_files={file_entry.path})
+        local_hits = search_chunks(
+            index,
+            user_input,
+            max_results=2,
+            allowed_files={file_entry.path},
+            use_embedding_retrieval=config.use_embedding_retrieval,
+        )
         if not local_hits:
             local_hits = get_file_chunks(index, file_entry.path)[:2]
         direct_seed_chunks.extend(local_hits[:2])
@@ -253,7 +295,12 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         direct_chunk_loaded += 1
 
     if tokens_used < token_budget_for_raw - 200:
-        keyword_chunks = search_chunks(index, user_input, max_results=8)
+        keyword_chunks = search_chunks(
+            index,
+            user_input,
+            max_results=8,
+            use_embedding_retrieval=config.use_embedding_retrieval,
+        )
         if not keyword_chunks:
             keyword_chunks = _chunks_from_search_results(index, search_index(index, user_input, max_results=8))
 
@@ -302,7 +349,12 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     if config.use_retrieval_subagent and raw_code_chunks:
         if config.use_multi_hop and is_complex_question(user_input):
             def _index_search_for_subquery(sub_query: str) -> list[str]:
-                sub_results = search_chunks(index, sub_query, max_results=5)
+                sub_results = search_chunks(
+                    index,
+                    sub_query,
+                    max_results=5,
+                    use_embedding_retrieval=config.use_embedding_retrieval,
+                )
                 if not sub_results:
                     sub_results = _chunks_from_search_results(index, search_index(index, sub_query, max_results=5))
                 formatted = [
@@ -355,11 +407,14 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         )
         debug_logs.append("subagent.retrieval_compressor used=0")
 
-    return {
+    result = {
         "_retrieved_context": context_text,
         "_turn_subagent_count": turn_subagent_count,
         "_turn_debug_logs": debug_logs,
     }
+    if index_updated:
+        result["codebase_index"] = index
+    return result
 
 
 def _append_raw_context(
@@ -597,6 +652,7 @@ def handle_exit(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     state, causing ``_display_response`` in main.py to replay the *previous*
     turn's answer — confusing the user.
     """
+    stop_background_reindexing(config.workspace_path)
     return {"messages": [AIMessage(content="Goodbye!")]}
 
 

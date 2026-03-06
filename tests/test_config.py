@@ -41,9 +41,27 @@ class TestAgentConfig:
     def test_new_production_defaults(self) -> None:
         config = AgentConfig()
         assert config.index_cache_enabled is True
+        assert config.use_embedding_retrieval is False
+        assert config.embedding_provider == "openai"
+        assert config.embedding_model == "text-embedding-3-large"
+        assert config.embedding_dimensions == 256
+        assert config.background_reindex_enabled is False
+        assert config.background_reindex_interval_seconds == 60.0
         assert config.cache_directory.name == ".cache"
         assert config.shell_timeout_seconds > 0
         assert config.allow_dangerous_shell_commands is False
+
+    def test_embedding_provider_must_be_supported(self) -> None:
+        with pytest.raises(ValueError, match="embedding_provider must be one of"):
+            AgentConfig(embedding_provider="unsupported")
+
+    def test_embedding_dimensions_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="embedding_dimensions must be > 0"):
+            AgentConfig(embedding_dimensions=0)
+
+    def test_background_reindex_interval_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="background_reindex_interval_seconds must be > 0"):
+            AgentConfig(background_reindex_interval_seconds=0)
 
     def test_shell_timeout_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="shell_timeout_seconds must be > 0"):

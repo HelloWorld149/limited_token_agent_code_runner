@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import gzip
+from hashlib import sha1
 import json
+import math
 import os
 import re
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
 
 from agent.state import ChunkEntry, CodebaseIndex, FileEntry, SymbolEntry
+from agent.token_utils import trim_text_to_token_budget
 
 
 # ---------------------------------------------------------------------------
@@ -55,12 +61,15 @@ SKIP_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".ico",
 }
 
-_INDEX_CACHE_VERSION = 2
-_INDEX_CACHE_FILE_NAME = ".codebase_index_cache_v2.json.gz"
+_INDEX_CACHE_VERSION = 3
+_INDEX_CACHE_FILE_NAME = ".codebase_index_cache_v3.json.gz"
 _MAX_INDEX_FILE_BYTES = 25_000_000
 _STREAMING_INDEX_THRESHOLD_BYTES = 2_000_000
 _MAX_SYMBOL_SCAN_BYTES = 1_500_000
 _MIN_CHUNK_LINES = 24
+_MAX_EMBEDDING_TEXT_CHARS = 2_500
+_MAX_EMBEDDING_INPUT_TOKENS = 5000
+_QUERY_EMBEDDING_CACHE_SIZE = 128
 
 _MAX_CHUNK_LINES_BY_LANG: dict[str, int] = {
     "c++": 140,
@@ -120,11 +129,181 @@ _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
 _BRIEF_RE = re.compile(r"(?:@brief|\\brief)\s+(.+)", re.MULTILINE)
 _CPP_FALSE_POSITIVES = {"if", "for", "while", "switch", "return", "catch", "sizeof", "alignof"}
 
+_EMBEDDING_BACKENDS_LOCK = threading.Lock()
+_EMBEDDING_BACKENDS: dict[str, "_EmbeddingBackend"] = {}
+_QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
+_QUERY_EMBEDDING_CACHE: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+_BACKGROUND_REINDEX_LOCK = threading.Lock()
+_BACKGROUND_REINDEX_MANAGER: "_BackgroundReindexManager | None" = None
+
+
+class _EmbeddingBackend(Protocol):
+    backend_name: str
+    model_name: str
+    dimensions: int
+    signature: str
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+
+class _HashingEmbeddingBackend:
+    """Deterministic local fallback embedding backend for offline/test scenarios."""
+
+    backend_name = "hashing"
+
+    def __init__(self, dimensions: int) -> None:
+        self.model_name = "hashing"
+        self.dimensions = dimensions
+        self.signature = f"hashing:{dimensions}"
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_text(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_text(text)
+
+    def _embed_text(self, text: str) -> list[float]:
+        text = _trim_embedding_text(text, self.model_name)
+        vector = [0.0] * self.dimensions
+        for feature in _iter_embedding_features(text):
+            digest = sha1(feature.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:4], "big") % self.dimensions
+            sign = -1.0 if digest[4] % 2 else 1.0
+            vector[bucket] += sign
+        return _normalize_vector(vector)
+
+
+class _OpenAIEmbeddingBackend:
+    backend_name = "openai"
+
+    def __init__(self, model_name: str, dimensions: int) -> None:
+        from langchain_openai import OpenAIEmbeddings
+
+        kwargs: dict[str, object] = {"model": model_name}
+        if model_name.startswith("text-embedding-3"):
+            kwargs["dimensions"] = dimensions
+        self._client = OpenAIEmbeddings(**kwargs)
+        self.model_name = model_name
+        self.dimensions = dimensions
+        self.signature = f"openai:{model_name}:{dimensions}"
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        trimmed_texts = [_trim_embedding_text(text, self.model_name) for text in texts]
+        vectors = self._client.embed_documents(trimmed_texts)
+        return [_normalize_vector(list(vector)) for vector in vectors]
+
+    def embed_query(self, text: str) -> list[float]:
+        vector = self._client.embed_query(_trim_embedding_text(text, self.model_name))
+        return _normalize_vector(list(vector))
+
+
+class _BackgroundReindexManager:
+    def __init__(
+        self,
+        *,
+        workspace_path: Path,
+        initial_index: CodebaseIndex,
+        interval_seconds: float,
+        use_persistent_cache: bool,
+        cache_directory: Path | None,
+        use_embedding_retrieval: bool,
+        embedding_provider: str,
+        embedding_model: str,
+        embedding_dimensions: int,
+    ) -> None:
+        self.workspace_path = workspace_path.resolve()
+        self.interval_seconds = interval_seconds
+        self.use_persistent_cache = use_persistent_cache
+        self.cache_directory = cache_directory.resolve() if cache_directory is not None else None
+        self.use_embedding_retrieval = use_embedding_retrieval
+        self.embedding_provider = embedding_provider
+        self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._index = initial_index
+        self._snapshot = _snapshot_workspace_files(self.workspace_path)
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"background-reindex:{self.workspace_path.name}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, min(self.interval_seconds * 2, 5.0)))
+
+    def matches(
+        self,
+        *,
+        workspace_path: Path,
+        interval_seconds: float,
+        use_persistent_cache: bool,
+        cache_directory: Path | None,
+        use_embedding_retrieval: bool,
+        embedding_provider: str,
+        embedding_model: str,
+        embedding_dimensions: int,
+    ) -> bool:
+        resolved_cache = cache_directory.resolve() if cache_directory is not None else None
+        return (
+            self.workspace_path == workspace_path.resolve()
+            and self.interval_seconds == interval_seconds
+            and self.use_persistent_cache == use_persistent_cache
+            and self.cache_directory == resolved_cache
+            and self.use_embedding_retrieval == use_embedding_retrieval
+            and self.embedding_provider == embedding_provider
+            and self.embedding_model == embedding_model
+            and self.embedding_dimensions == embedding_dimensions
+        )
+
+    def refresh_initial_index(self, index: CodebaseIndex) -> None:
+        with self._lock:
+            self._index = index
+            self._snapshot = _snapshot_workspace_files(self.workspace_path)
+
+    def current_index(self) -> CodebaseIndex:
+        with self._lock:
+            return self._index
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            latest_snapshot = _snapshot_workspace_files(self.workspace_path)
+            with self._lock:
+                if latest_snapshot == self._snapshot:
+                    continue
+
+            try:
+                refreshed_index = build_codebase_index(
+                    self.workspace_path,
+                    use_persistent_cache=self.use_persistent_cache,
+                    cache_directory=self.cache_directory,
+                    use_embedding_retrieval=self.use_embedding_retrieval,
+                    embedding_provider=self.embedding_provider,
+                    embedding_model=self.embedding_model,
+                    embedding_dimensions=self.embedding_dimensions,
+                )
+            except Exception:
+                continue
+
+            with self._lock:
+                self._index = refreshed_index
+                self._snapshot = latest_snapshot
+
 
 def build_codebase_index(
     workspace_path: Path,
     use_persistent_cache: bool = True,
     cache_directory: Path | None = None,
+    use_embedding_retrieval: bool = False,
+    embedding_provider: str = "openai",
+    embedding_model: str = "text-embedding-3-large",
+    embedding_dimensions: int = 256,
 ) -> CodebaseIndex:
     """Walk the workspace and build file, symbol, chunk, and summary indexes."""
     resolved_workspace = workspace_path.resolve()
@@ -133,6 +312,24 @@ def build_codebase_index(
     symbols: list[SymbolEntry] = []
     chunks: list[ChunkEntry] = []
     chunks_by_file: dict[str, list[int]] = {}
+    indexed_at_ns = time.time_ns()
+
+    embedding_backend = _resolve_embedding_backend(
+        use_embedding_retrieval=use_embedding_retrieval,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+    )
+    embedding_signature = ""
+    embedding_backend_name = "disabled"
+    resolved_embedding_model = ""
+    resolved_embedding_dimensions = 0
+    if embedding_backend is not None:
+        _register_embedding_backend(embedding_backend)
+        embedding_signature = embedding_backend.signature
+        embedding_backend_name = embedding_backend.backend_name
+        resolved_embedding_model = embedding_backend.model_name
+        resolved_embedding_dimensions = embedding_backend.dimensions
 
     cached_records = (
         _load_cached_records(resolved_workspace, cache_directory)
@@ -158,6 +355,12 @@ def build_codebase_index(
         cached_record = cached_records.get(rel_path)
         if cached_record is not None and cached_record.get("fingerprint") == fingerprint:
             file_entry, file_chunks, file_symbols = _deserialize_cached_record(cached_record)
+            if embedding_backend is not None and not _cached_record_has_matching_embeddings(
+                cached_record,
+                embedding_signature,
+                len(file_chunks),
+            ):
+                _populate_chunk_embeddings(file_chunks, embedding_backend)
         else:
             file_entry, file_chunks, file_symbols = _index_single_file(
                 filepath=filepath,
@@ -165,11 +368,14 @@ def build_codebase_index(
                 stat=stat,
                 lang=lang,
             )
+            if embedding_backend is not None:
+                _populate_chunk_embeddings(file_chunks, embedding_backend)
         records_to_cache[rel_path] = _serialize_cached_record(
             fingerprint=fingerprint,
             file_entry=file_entry,
             file_chunks=file_chunks,
             file_symbols=file_symbols,
+            embedding_signature=(embedding_signature if _chunks_have_embeddings(file_chunks) else ""),
         )
         files.append(file_entry)
         symbols.extend(file_symbols)
@@ -195,6 +401,11 @@ def build_codebase_index(
         chunks=chunks,
         chunks_by_file=chunks_by_file,
         repository_summary=repository_summary,
+        embedding_backend=embedding_backend_name,
+        embedding_model=resolved_embedding_model,
+        embedding_dimensions=resolved_embedding_dimensions,
+        embedding_signature=embedding_signature,
+        indexed_at_ns=indexed_at_ns,
     )
 
 
@@ -221,6 +432,260 @@ def _file_fingerprint(stat: os.stat_result) -> dict[str, int]:
         "size": int(stat.st_size),
         "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
     }
+
+
+def _snapshot_workspace_files(workspace_path: Path) -> dict[str, dict[str, int]]:
+    snapshot: dict[str, dict[str, int]] = {}
+    for filepath in _iter_workspace_files(workspace_path.resolve()):
+        try:
+            stat = filepath.stat()
+        except OSError:
+            continue
+        rel_path = str(filepath.relative_to(workspace_path.resolve())).replace("\\", "/")
+        snapshot[rel_path] = _file_fingerprint(stat)
+    return snapshot
+
+
+def _resolve_embedding_backend(
+    *,
+    use_embedding_retrieval: bool,
+    embedding_provider: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> _EmbeddingBackend | None:
+    if not use_embedding_retrieval:
+        return None
+
+    provider = (embedding_provider or "openai").strip().lower()
+    if provider == "hashing":
+        return _HashingEmbeddingBackend(embedding_dimensions)
+
+    if provider == "openai":
+        backend = _try_create_openai_embedding_backend(embedding_model, embedding_dimensions)
+        if backend is None:
+            raise RuntimeError(
+                "OpenAI embedding provider is required but could not be initialized. "
+                "Check OpenAI credentials and embedding model availability."
+            )
+        return backend
+
+    openai_backend = _try_create_openai_embedding_backend(embedding_model, embedding_dimensions)
+    if openai_backend is not None:
+        return openai_backend
+    return _HashingEmbeddingBackend(embedding_dimensions)
+
+
+def _try_create_openai_embedding_backend(
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> _EmbeddingBackend | None:
+    try:
+        return _OpenAIEmbeddingBackend(embedding_model, embedding_dimensions)
+    except Exception:
+        return None
+
+
+def _register_embedding_backend(backend: _EmbeddingBackend) -> None:
+    with _EMBEDDING_BACKENDS_LOCK:
+        _EMBEDDING_BACKENDS[backend.signature] = backend
+
+
+def _get_registered_embedding_backend(signature: str) -> _EmbeddingBackend | None:
+    with _EMBEDDING_BACKENDS_LOCK:
+        return _EMBEDDING_BACKENDS.get(signature)
+
+
+def _cached_record_has_matching_embeddings(
+    record: dict[str, object],
+    embedding_signature: str,
+    expected_chunk_count: int,
+) -> bool:
+    if not embedding_signature:
+        return True
+
+    if str(record.get("embedding_signature", "")) != embedding_signature:
+        return False
+
+    raw_chunks = record.get("chunks")
+    if not isinstance(raw_chunks, list) or len(raw_chunks) != expected_chunk_count:
+        return False
+
+    return all(
+        isinstance(chunk, dict)
+        and isinstance(chunk.get("embedding"), list)
+        and bool(chunk.get("embedding"))
+        for chunk in raw_chunks
+    )
+
+
+def _chunks_have_embeddings(chunks: list[ChunkEntry]) -> bool:
+    return all(bool(chunk.embedding) for chunk in chunks) if chunks else False
+
+
+def _populate_chunk_embeddings(
+    file_chunks: list[ChunkEntry],
+    backend: _EmbeddingBackend,
+) -> None:
+    if not file_chunks:
+        return
+
+    embedding_texts = [_build_chunk_embedding_text(chunk) for chunk in file_chunks]
+    for chunk in file_chunks:
+        chunk.embedding = []
+    try:
+        vectors = backend.embed_documents(embedding_texts)
+    except Exception:
+        return
+
+    for chunk, vector in zip(file_chunks, vectors, strict=False):
+        chunk.embedding = _normalize_vector(vector)
+
+
+def _build_chunk_embedding_text(chunk: ChunkEntry) -> str:
+    parts = [
+        chunk.file_path,
+        chunk.heading,
+        chunk.summary,
+        " ".join(chunk.declarations[:8]),
+        " ".join(chunk.symbol_names[:8]),
+        chunk.text[:_MAX_EMBEDDING_TEXT_CHARS],
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _trim_embedding_text(text: str, model_name: str) -> str:
+    return trim_text_to_token_budget(text, model_name, _MAX_EMBEDDING_INPUT_TOKENS)
+
+
+def _iter_embedding_features(text: str) -> Iterable[str]:
+    tokens = re.findall(r"[A-Za-z0-9_./:-]+", text.lower())
+    for token in tokens:
+        yield f"tok:{token}"
+        if len(token) >= 4:
+            for index in range(len(token) - 2):
+                yield f"tri:{token[index:index + 3]}"
+
+
+def _normalize_vector(vector: list[float]) -> list[float]:
+    if not vector:
+        return []
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0.0:
+        return []
+    return [value / norm for value in vector]
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    return sum(l_value * r_value for l_value, r_value in zip(left, right, strict=False))
+
+
+def _get_query_embedding(index: CodebaseIndex, query: str) -> list[float]:
+    if not index.embedding_signature or not query.strip():
+        return []
+
+    cache_key = (index.embedding_signature, query.strip().lower())
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        cached = _QUERY_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            _QUERY_EMBEDDING_CACHE.move_to_end(cache_key)
+            return cached
+
+    backend = _get_registered_embedding_backend(index.embedding_signature)
+    if backend is None:
+        return []
+
+    try:
+        embedding = _normalize_vector(backend.embed_query(query))
+    except Exception:
+        return []
+
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        _QUERY_EMBEDDING_CACHE[cache_key] = embedding
+        _QUERY_EMBEDDING_CACHE.move_to_end(cache_key)
+        while len(_QUERY_EMBEDDING_CACHE) > _QUERY_EMBEDDING_CACHE_SIZE:
+            _QUERY_EMBEDDING_CACHE.popitem(last=False)
+    return embedding
+
+
+def configure_background_reindexing(
+    *,
+    workspace_path: Path,
+    initial_index: CodebaseIndex,
+    enabled: bool,
+    interval_seconds: float,
+    use_persistent_cache: bool,
+    cache_directory: Path | None,
+    use_embedding_retrieval: bool,
+    embedding_provider: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> None:
+    global _BACKGROUND_REINDEX_MANAGER
+
+    resolved_workspace = workspace_path.resolve()
+    with _BACKGROUND_REINDEX_LOCK:
+        existing = _BACKGROUND_REINDEX_MANAGER
+        if not enabled:
+            if existing is not None:
+                existing.stop()
+                _BACKGROUND_REINDEX_MANAGER = None
+            return
+
+        if existing is not None and existing.matches(
+            workspace_path=resolved_workspace,
+            interval_seconds=interval_seconds,
+            use_persistent_cache=use_persistent_cache,
+            cache_directory=cache_directory,
+            use_embedding_retrieval=use_embedding_retrieval,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+            embedding_dimensions=embedding_dimensions,
+        ):
+            existing.refresh_initial_index(initial_index)
+            return
+
+        if existing is not None:
+            existing.stop()
+
+        manager = _BackgroundReindexManager(
+            workspace_path=resolved_workspace,
+            initial_index=initial_index,
+            interval_seconds=interval_seconds,
+            use_persistent_cache=use_persistent_cache,
+            cache_directory=cache_directory,
+            use_embedding_retrieval=use_embedding_retrieval,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+            embedding_dimensions=embedding_dimensions,
+        )
+        _BACKGROUND_REINDEX_MANAGER = manager
+        manager.start()
+
+
+def get_live_codebase_index(
+    workspace_path: Path,
+    fallback: CodebaseIndex,
+) -> CodebaseIndex:
+    with _BACKGROUND_REINDEX_LOCK:
+        manager = _BACKGROUND_REINDEX_MANAGER
+    if manager is None or manager.workspace_path != workspace_path.resolve():
+        return fallback
+    return manager.current_index()
+
+
+def stop_background_reindexing(workspace_path: Path | None = None) -> None:
+    global _BACKGROUND_REINDEX_MANAGER
+
+    with _BACKGROUND_REINDEX_LOCK:
+        manager = _BACKGROUND_REINDEX_MANAGER
+        if manager is None:
+            return
+        if workspace_path is not None and manager.workspace_path != workspace_path.resolve():
+            return
+        _BACKGROUND_REINDEX_MANAGER = None
+    manager.stop()
 
 
 def _load_cached_records(
@@ -277,9 +742,11 @@ def _serialize_cached_record(
     file_entry: FileEntry,
     file_chunks: list[ChunkEntry],
     file_symbols: list[SymbolEntry],
+    embedding_signature: str = "",
 ) -> dict[str, object]:
     return {
         "fingerprint": fingerprint,
+        "embedding_signature": embedding_signature,
         "file_entry": asdict(file_entry),
         "chunks": [asdict(chunk) for chunk in file_chunks],
         "symbols": [asdict(symbol) for symbol in file_symbols],
@@ -1165,11 +1632,13 @@ def search_chunks(
     query: str,
     max_results: int = 10,
     allowed_files: set[str] | None = None,
+    use_embedding_retrieval: bool = False,
 ) -> list[ChunkEntry]:
     """Search semantic chunks using path hints, summaries, symbols, and lexical matches."""
     keywords = _query_keywords(query)
     if not keywords and allowed_files:
         keywords = [Path(path).name.lower() for path in allowed_files]
+    query_embedding = _get_query_embedding(index, query) if use_embedding_retrieval else []
 
     symbol_hits_by_file: dict[str, list[SymbolEntry]] = {}
     for symbol in index.symbols:
@@ -1184,7 +1653,7 @@ def search_chunks(
         if allowed_files and chunk.file_path not in allowed_files:
             continue
 
-        score = 0.0
+        lexical_score = 0.0
         path_lower = chunk.file_path.lower()
         text = (
             f"{chunk.file_path} {chunk.heading} {chunk.summary} "
@@ -1195,26 +1664,36 @@ def search_chunks(
 
         for kw in keywords:
             if kw in text:
-                score += 1.5
+                lexical_score += 1.5
             if kw in path_lower:
-                score += 1.0
+                lexical_score += 1.0
             if kw in lexical_body:
-                score += 0.5
+                lexical_score += 0.5
             if chunk.heading and kw in chunk.heading.lower():
-                score += 1.0
+                lexical_score += 1.0
             if any(kw == name.lower() for name in chunk.symbol_names):
-                score += 3.0
+                lexical_score += 3.0
             if any(kw in decl.lower() for decl in chunk.declarations):
-                score += 1.5
+                lexical_score += 1.5
             if file_entry and kw in file_entry.summary.lower():
-                score += 0.5
+                lexical_score += 0.5
 
         for symbol in symbol_hits_by_file.get(chunk.file_path, []):
             if chunk.start_line <= symbol.line <= chunk.end_line:
-                score += 4.0
+                lexical_score += 4.0
 
         if file_entry and file_entry.purpose and any(kw in file_entry.purpose.lower() for kw in keywords):
-            score += 0.5
+            lexical_score += 0.5
+
+        semantic_score = 0.0
+        if query_embedding and chunk.embedding:
+            semantic_score = max(0.0, _cosine_similarity(query_embedding, chunk.embedding))
+
+        score = lexical_score
+        if semantic_score > 0.0:
+            score += semantic_score * 4.0
+            if semantic_score >= 0.85:
+                score += 0.75
 
         if score > 0:
             scored.append((score, idx))

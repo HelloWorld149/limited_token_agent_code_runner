@@ -60,6 +60,7 @@ class ChunkEntry:
     symbol_names: list[str] = field(default_factory=list)
     declarations: list[str] = field(default_factory=list)
     text: str = ""
+    embedding: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -80,6 +81,11 @@ class CodebaseIndex:
     chunks: list[ChunkEntry] = field(default_factory=list)
     chunks_by_file: dict[str, list[int]] = field(default_factory=dict)
     repository_summary: str = ""
+    embedding_backend: str = "disabled"
+    embedding_model: str = ""
+    embedding_dimensions: int = 0
+    embedding_signature: str = ""
+    indexed_at_ns: int = 0
 
 
 # ---------------------------------------------------------------------------

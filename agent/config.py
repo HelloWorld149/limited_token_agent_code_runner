@@ -70,6 +70,24 @@ class AgentConfig:
     index_cache_enabled: bool = field(
         default_factory=lambda: os.getenv("AGENT_INDEX_CACHE_ENABLED", "true").lower() == "true"
     )
+    use_embedding_retrieval: bool = field(
+        default_factory=lambda: os.getenv("AGENT_USE_EMBEDDING_RETRIEVAL", "false").lower() == "true"
+    )
+    embedding_provider: str = field(
+        default_factory=lambda: (os.getenv("AGENT_EMBEDDING_PROVIDER", "openai") or "openai").strip().lower()
+    )
+    embedding_model: str = field(
+        default_factory=lambda: os.getenv("AGENT_EMBEDDING_MODEL", "text-embedding-3-large")
+    )
+    embedding_dimensions: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_DIMENSIONS", "256"))
+    )
+    background_reindex_enabled: bool = field(
+        default_factory=lambda: os.getenv("AGENT_BACKGROUND_REINDEX_ENABLED", "false").lower() == "true"
+    )
+    background_reindex_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("AGENT_BACKGROUND_REINDEX_INTERVAL_SECONDS", "60"))
+    )
     shell_timeout_seconds: int = field(
         default_factory=lambda: int(os.getenv("AGENT_SHELL_TIMEOUT_SECONDS", "1500"))
     )
@@ -93,6 +111,14 @@ class AgentConfig:
             raise ValueError("retrieval_digest_tokens must be < token_budget (5000)")
         if self.tool_summary_tokens >= self.token_budget:
             raise ValueError("tool_summary_tokens must be < token_budget (5000)")
+        if self.embedding_provider not in {"auto", "openai", "hashing"}:
+            raise ValueError("embedding_provider must be one of: auto, openai, hashing")
+        if not self.embedding_model.strip():
+            raise ValueError("embedding_model must not be empty")
+        if self.embedding_dimensions <= 0:
+            raise ValueError("embedding_dimensions must be > 0")
+        if self.background_reindex_interval_seconds <= 0:
+            raise ValueError("background_reindex_interval_seconds must be > 0")
         if self.shell_timeout_seconds <= 0:
             raise ValueError("shell_timeout_seconds must be > 0")
         if cache_directory == workspace_path or cache_directory.is_relative_to(workspace_path):

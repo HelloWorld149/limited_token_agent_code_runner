@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 from hashlib import sha1
 from pathlib import Path
+import time
+
+import pytest
 
 from agent.config import AgentConfig
 from agent.indexer import (
@@ -12,9 +17,11 @@ from agent.indexer import (
     format_file_outline,
     get_file_chunks,
     search_chunks,
+    stop_background_reindexing,
 )
-from agent.nodes import retrieve_context
+from agent.nodes import index_workspace, retrieve_context
 from agent.state import BuildState
+from agent.token_utils import estimate_text_tokens
 
 
 MODEL = "gpt-4o-mini"
@@ -88,8 +95,8 @@ class TestChunkAwareIndexing:
         second_index = build_codebase_index(tmp_path, use_persistent_cache=True, cache_directory=cache_dir)
         assert any(file.path == "docs/cached.md" for file in second_index.files)
         assert calls == []
-        assert (cache_dir / ".codebase_index_cache_v2.json.gz").exists()
-        assert not (tmp_path / ".codebase_index_cache_v2.json.gz").exists()
+        assert (cache_dir / ".codebase_index_cache_v3.json.gz").exists()
+        assert not (tmp_path / ".codebase_index_cache_v3.json.gz").exists()
 
     def test_persistent_cache_invalidates_changed_files(self, tmp_path: Path, monkeypatch) -> None:
         target = tmp_path / "docs" / "invalidate.md"
@@ -123,7 +130,7 @@ class TestChunkAwareIndexing:
         _write(target, "# Cached\n\nalpha\n")
 
         build_codebase_index(tmp_path, use_persistent_cache=True, cache_directory=cache_dir)
-        cache_file = cache_dir / ".codebase_index_cache_v2.json.gz"
+        cache_file = cache_dir / ".codebase_index_cache_v3.json.gz"
         original_payload = cache_file.read_bytes()
 
         import agent.indexer as indexer_mod
@@ -138,6 +145,67 @@ class TestChunkAwareIndexing:
 
         assert cache_file.read_bytes() == original_payload
         assert not cache_file.with_name(f"{cache_file.name}.tmp").exists()
+
+    def test_cache_persists_chunk_embeddings(self, tmp_path: Path, monkeypatch) -> None:
+        _write(tmp_path / "docs" / "embedded.md", "# Embedded\n\ncar engine diagnostics\n")
+        cache_dir = _cache_dir_for(tmp_path)
+
+        import agent.indexer as indexer_mod
+
+        class FakeEmbeddingBackend:
+            backend_name = "fake"
+            model_name = "fake-semantic"
+            dimensions = 3
+            signature = "fake:semantic:3"
+
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                return [self.embed_query(text) for text in texts]
+
+            def embed_query(self, text: str) -> list[float]:
+                lowered = text.lower()
+                if "car" in lowered or "engine" in lowered:
+                    return [1.0, 0.0, 0.0]
+                return [0.0, 1.0, 0.0]
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_resolve_embedding_backend",
+            lambda **_: FakeEmbeddingBackend(),
+        )
+
+        build_codebase_index(
+            tmp_path,
+            use_persistent_cache=True,
+            cache_directory=cache_dir,
+            use_embedding_retrieval=True,
+        )
+
+        cache_file = cache_dir / ".codebase_index_cache_v3.json.gz"
+        with gzip.open(cache_file, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        record = payload["records"]["docs/embedded.md"]
+        assert record["embedding_signature"] == "fake:semantic:3"
+        assert record["chunks"][0]["embedding"] == [1.0, 0.0, 0.0]
+
+    def test_openai_provider_fails_fast_when_backend_unavailable(self, tmp_path: Path, monkeypatch) -> None:
+        _write(tmp_path / "docs" / "embedded.md", "# Embedded\n\ncar engine diagnostics\n")
+
+        import agent.indexer as indexer_mod
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_try_create_openai_embedding_backend",
+            lambda *args, **kwargs: None,
+        )
+
+        with pytest.raises(RuntimeError, match="OpenAI embedding provider is required"):
+            build_codebase_index(
+                tmp_path,
+                use_persistent_cache=False,
+                use_embedding_retrieval=True,
+                embedding_provider="openai",
+            )
 
     def test_search_chunks_and_neighbor_expansion_preserve_section_context(self, tmp_path: Path) -> None:
         content = "\n".join(
@@ -187,6 +255,105 @@ class TestChunkAwareIndexing:
 
 
 class TestChunkAwareRetrieval:
+    def test_search_chunks_uses_embedding_similarity_when_enabled(self, tmp_path: Path, monkeypatch) -> None:
+        _write(tmp_path / "docs" / "vehicles.md", "# Vehicles\n\nThe car engine and drivetrain need regular maintenance.\n")
+        _write(tmp_path / "docs" / "fruit.md", "# Fruit\n\nBanana smoothie preparation notes.\n")
+
+        import agent.indexer as indexer_mod
+
+        class FakeEmbeddingBackend:
+            backend_name = "fake"
+            model_name = "fake-semantic"
+            dimensions = 3
+            signature = "fake:semantic:3"
+
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                return [self.embed_query(text) for text in texts]
+
+            def embed_query(self, text: str) -> list[float]:
+                lowered = text.lower()
+                if any(term in lowered for term in ("car", "engine", "drivetrain", "automobile", "servicing")):
+                    return [1.0, 0.0, 0.0]
+                if "banana" in lowered or "fruit" in lowered:
+                    return [0.0, 1.0, 0.0]
+                return [0.0, 0.0, 1.0]
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_resolve_embedding_backend",
+            lambda **_: FakeEmbeddingBackend(),
+        )
+
+        index = build_codebase_index(
+            tmp_path,
+            use_persistent_cache=False,
+            use_embedding_retrieval=True,
+        )
+
+        lexical_only = search_chunks(
+            index,
+            "automobile servicing",
+            max_results=2,
+            use_embedding_retrieval=False,
+        )
+        semantic_hits = search_chunks(
+            index,
+            "automobile servicing",
+            max_results=2,
+            use_embedding_retrieval=True,
+        )
+
+        assert lexical_only == []
+        assert semantic_hits
+        assert semantic_hits[0].file_path == "docs/vehicles.md"
+        assert semantic_hits[0].embedding == [1.0, 0.0, 0.0]
+
+    def test_embedding_requests_are_trimmed_to_5000_tokens(self, tmp_path: Path, monkeypatch) -> None:
+        oversized_text = "alpha " * 8000
+        _write(tmp_path / "docs" / "oversized.md", f"# Oversized\n\n{oversized_text}\n")
+
+        import agent.indexer as indexer_mod
+
+        captured_texts: list[str] = []
+
+        class FakeEmbeddingBackend:
+            backend_name = "fake"
+            model_name = "text-embedding-3-large"
+            dimensions = 3
+            signature = "fake:semantic:3"
+
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                captured_texts.extend(texts)
+                return [[1.0, 0.0, 0.0] for _ in texts]
+
+            def embed_query(self, text: str) -> list[float]:
+                captured_texts.append(text)
+                return [1.0, 0.0, 0.0]
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_resolve_embedding_backend",
+            lambda **_: FakeEmbeddingBackend(),
+        )
+
+        index = build_codebase_index(
+            tmp_path,
+            use_persistent_cache=False,
+            use_embedding_retrieval=True,
+        )
+        search_chunks(
+            index,
+            "alpha concept",
+            max_results=1,
+            use_embedding_retrieval=True,
+        )
+
+        assert captured_texts
+        assert all(
+            estimate_text_tokens(text, "text-embedding-3-large") <= 5000
+            for text in captured_texts
+        )
+
     def test_retrieve_context_uses_matching_late_chunk_not_file_prefix(self, tmp_path: Path) -> None:
         content = "\n".join(
             [
@@ -232,3 +399,62 @@ class TestChunkAwareRetrieval:
         assert "architecture.md" in context
         assert "lines" in context
         assert "intro line 0" not in context
+
+    def test_background_reindex_refreshes_retrieve_context(self, tmp_path: Path) -> None:
+        live_file = tmp_path / "docs" / "live.md"
+        _write(live_file, "# Live\n\ninitial release notes\n")
+
+        config = AgentConfig(
+            model_name=MODEL,
+            classifier_model=MODEL,
+            subagent_model=MODEL,
+            workspace_path=tmp_path,
+            use_retrieval_subagent=False,
+            use_tool_summarizer=False,
+            use_conversation_compressor=False,
+            use_multi_hop=False,
+            background_reindex_enabled=True,
+            background_reindex_interval_seconds=0.1,
+        )
+        state = {
+            "messages": [],
+            "summary_of_knowledge": "",
+            "codebase_index": build_codebase_index(tmp_path, use_persistent_cache=False),
+            "current_intent": "QUESTION",
+            "build_state": BuildState(),
+            "turn_count": 0,
+            "last_user_input": "",
+            "_retrieved_context": "",
+            "_tool_iteration_count": 0,
+            "_turn_subagent_count": 0,
+            "_turn_debug_logs": [],
+        }
+
+        try:
+            started = index_workspace(state, config)
+            started_index = started["codebase_index"]
+            _write(live_file, "# Live\n\nbeta rollout guide\n")
+
+            poll_state = {
+                **state,
+                **started,
+                "last_user_input": "Where is the beta rollout guide described?",
+                "_turn_debug_logs": [],
+            }
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                result = retrieve_context(poll_state, config)
+                if "beta rollout guide" in result.get("_retrieved_context", ""):
+                    refreshed_index = result.get("codebase_index", started_index)
+                    assert refreshed_index.indexed_at_ns >= started_index.indexed_at_ns
+                    assert any(
+                        "background_reindex.refresh" in entry
+                        for entry in result.get("_turn_debug_logs", [])
+                    )
+                    break
+                time.sleep(0.15)
+            else:
+                raise AssertionError("background reindex did not refresh the live index in time")
+        finally:
+            stop_background_reindexing(tmp_path)
