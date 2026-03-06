@@ -285,7 +285,7 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 
 | Function | Purpose |
 |---|---|
-| `index_workspace(state, config)` | Startup: verify workspace, `os.chdir()`, `set_workspace_root()`, `build_codebase_index()`, `_probe_environment()` |
+| `index_workspace(state, config)` | Startup: verify workspace, `set_workspace_root()`, `build_codebase_index()`, configure optional background reindexing, `_probe_environment()` |
 | `classify_and_prepare(state, config)` | Single-pass context-aware intent classification via `classify_intent_sync()` (with dialog context), conversation compressor every 3 turns |
 | `retrieve_context(state, config)` | Three-layer retrieval + subagent compression (retrieval or multi-hop) |
 | `answer_question(state, config)` | QUESTION handler — calls `_invoke_llm_with_context(use_tools=True)` |
@@ -315,7 +315,7 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
   8. Invokes model, normalizes response via `normalize_ai_message()`
   9. Falls back to error `AIMessage` on exception
 
-- `_probe_environment(workspace_path)` — Detects OS, cmake, ninja, g++, make/mingw32-make, recommends generator
+- `_probe_environment(workspace_path)` — Detects OS, cmake, ninja, g++, make/mingw32-make via `shutil.which()` + `subprocess.run(..., shell=False)`
 - `_update_build_state(messages, current)` — Parses recent `ToolMessage`s for `[cmd]=` and `[exit_code]=` markers, returns a new frozen `BuildState`
 
 **retrieve_context Details:**
@@ -522,16 +522,16 @@ main.py: main()
   build_init_graph(config).invoke(init_state)
     ↓
     index_workspace():
-      1. os.chdir(workspace_path)
-      2. set_workspace_root(workspace_path)
-      3. build_codebase_index(workspace_path)
+      1. set_workspace_root(workspace_path)
+      2. build_codebase_index(workspace_path)
          - Walk all files (skip SKIP_DIRS, SKIP_EXTENSIONS, >500KB)
          - For each file: detect language, build rich summary, detect purpose, extract declarations
          - For C/C++ files: extract symbols (classes, structs, macros, functions)
-      4. _probe_environment(workspace_path)
+         - Optionally compute chunk embeddings and enable background reindex refresh
+      3. _probe_environment(workspace_path)
          - Detect OS, cmake version, ninja version, g++ version, make/mingw32-make
-         - Recommend cmake generator
-      5. Return initial state:
+         - Uses `shell=False` argument lists rather than shell parsing
+      4. Return initial state:
          - summary_of_knowledge: "Workspace: ... | Files: N | Symbols: M | os=... | cmake=... | ..."
          - codebase_index: populated CodebaseIndex
          - build_state: BuildState(IDLE)
@@ -738,7 +738,7 @@ Each sub-agent is an independent LLM call with its own 5000-token budget. They e
 def execute_shell_command(cmd: str) -> str:
 ```
 
-Run a shell command via `subprocess.run(shell=True)`. Output format:
+Run a shell command via allowlisted `subprocess.run(..., shell=False)` by default. `shell=True` is used only when dangerous shell commands are explicitly enabled. Output format:
 
 ```
 command=<normalized_cmd>

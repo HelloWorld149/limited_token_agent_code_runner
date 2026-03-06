@@ -33,7 +33,7 @@ class AgentConfig:
         default_factory=lambda: int(os.getenv("AGENT_OUTPUT_TOKENS", "1000"))
     )
     max_tool_iterations: int = field(
-        default_factory=lambda: int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "3"))
+        default_factory=lambda: int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "10"))
     )
     workspace_path: Path = field(
         default_factory=lambda: Path(

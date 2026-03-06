@@ -19,6 +19,7 @@ from agent.indexer import (
     expand_chunk_window,
     format_file_outline,
     format_file_manifest_summary,
+    get_background_reindex_status,
     get_live_codebase_index,
     get_file_chunks,
     search_chunks,
@@ -216,6 +217,7 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     user_input = state.get("last_user_input", "")
     original_index = state.get("codebase_index", CodebaseIndex())
     index = get_live_codebase_index(config.workspace_path, original_index)
+    reindex_status = get_background_reindex_status(config.workspace_path)
 
     raw_code_chunks: list[str] = []
     debug_logs = list(state.get("_turn_debug_logs", []))
@@ -228,6 +230,14 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             "background_reindex.refresh "
             f"chunks={len(index.chunks)} indexed_at_ns={index.indexed_at_ns}"
         )
+    if reindex_status.get("enabled"):
+        failures = int(reindex_status.get("consecutive_failures", 0))
+        last_error = str(reindex_status.get("last_error", "")).strip()
+        if failures > 0 and last_error:
+            debug_logs.append(
+                "background_reindex.health "
+                f"failures={failures} last_error={last_error[:180]}"
+            )
 
     if config.use_retrieval_subagent:
         token_budget_for_raw = 3000
@@ -733,24 +743,32 @@ def _probe_environment(workspace_path: Path) -> list[str]:
     facts.append(f"os={platform.system()}")
 
     tool_checks = [
-        ("cmake --version", "cmake"),
-        ("ninja --version", "ninja"),
+        (["cmake", "--version"], "cmake"),
+        (["ninja", "--version"], "ninja"),
     ]
     if os.name == "nt":
         tool_checks.extend([
-            ("g++ --version", "gxx"),
-            ("mingw32-make --version", "mingw32_make"),
+            (["g++", "--version"], "gxx"),
+            (["mingw32-make", "--version"], "mingw32_make"),
         ])
     else:
         tool_checks.extend([
-            ("g++ --version", "gxx"),
-            ("make --version", "make"),
+            (["g++", "--version"], "gxx"),
+            (["make", "--version"], "make"),
         ])
 
-    for cmd, label in tool_checks:
+    for cmd_args, label in tool_checks:
         try:
+            executable = shutil.which(cmd_args[0])
+            if not executable:
+                facts.append(f"{label}=not_found")
+                continue
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=5
+                [executable, *cmd_args[1:]],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode == 0:
                 first_line = (result.stdout or "").strip().split("\n")[0][:80]

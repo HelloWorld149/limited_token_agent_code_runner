@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 from hashlib import sha1
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +16,9 @@ from typing import Iterable, Protocol
 
 from agent.state import ChunkEntry, CodebaseIndex, FileEntry, SymbolEntry
 from agent.token_utils import trim_text_to_token_budget
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +229,10 @@ class _BackgroundReindexManager:
         self._stop_event = threading.Event()
         self._index = initial_index
         self._snapshot = _snapshot_workspace_files(self.workspace_path)
+        self._last_success_ns = initial_index.indexed_at_ns
+        self._last_error = ""
+        self._last_error_ns = 0
+        self._consecutive_failures = 0
         self._thread = threading.Thread(
             target=self._run,
             name=f"background-reindex:{self.workspace_path.name}",
@@ -271,6 +279,17 @@ class _BackgroundReindexManager:
         with self._lock:
             return self._index
 
+    def current_status(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "enabled": True,
+                "workspace_path": str(self.workspace_path),
+                "last_success_ns": self._last_success_ns,
+                "last_error": self._last_error,
+                "last_error_ns": self._last_error_ns,
+                "consecutive_failures": self._consecutive_failures,
+            }
+
     def _run(self) -> None:
         while not self._stop_event.wait(self.interval_seconds):
             latest_snapshot = _snapshot_workspace_files(self.workspace_path)
@@ -288,12 +307,26 @@ class _BackgroundReindexManager:
                     embedding_model=self.embedding_model,
                     embedding_dimensions=self.embedding_dimensions,
                 )
-            except Exception:
+            except Exception as exc:
+                message = _summarize_exception(exc)
+                logger.warning(
+                    "Background reindex failed for %s: %s",
+                    self.workspace_path,
+                    message,
+                )
+                with self._lock:
+                    self._last_error = message
+                    self._last_error_ns = time.time_ns()
+                    self._consecutive_failures += 1
                 continue
 
             with self._lock:
                 self._index = refreshed_index
                 self._snapshot = latest_snapshot
+                self._last_success_ns = refreshed_index.indexed_at_ns
+                self._last_error = ""
+                self._last_error_ns = 0
+                self._consecutive_failures = 0
 
 
 def build_codebase_index(
@@ -534,7 +567,14 @@ def _populate_chunk_embeddings(
         chunk.embedding = []
     try:
         vectors = backend.embed_documents(embedding_texts)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to populate chunk embeddings for %s with backend=%s model=%s: %s",
+            file_chunks[0].file_path,
+            backend.backend_name,
+            backend.model_name,
+            _summarize_exception(exc),
+        )
         return
 
     for chunk, vector in zip(file_chunks, vectors, strict=False):
@@ -594,19 +634,41 @@ def _get_query_embedding(index: CodebaseIndex, query: str) -> list[float]:
 
     backend = _get_registered_embedding_backend(index.embedding_signature)
     if backend is None:
+        logger.warning(
+            "No registered embedding backend is available for signature=%s; falling back to lexical retrieval",
+            index.embedding_signature,
+        )
+        _store_query_embedding(cache_key, [])
         return []
 
     try:
         embedding = _normalize_vector(backend.embed_query(query))
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to compute query embedding for signature=%s: %s",
+            index.embedding_signature,
+            _summarize_exception(exc),
+        )
+        _store_query_embedding(cache_key, [])
         return []
 
+    _store_query_embedding(cache_key, embedding)
+    return embedding
+
+
+def _store_query_embedding(
+    cache_key: tuple[str, str],
+    embedding: list[float],
+) -> None:
     with _QUERY_EMBEDDING_CACHE_LOCK:
         _QUERY_EMBEDDING_CACHE[cache_key] = embedding
         _QUERY_EMBEDDING_CACHE.move_to_end(cache_key)
         while len(_QUERY_EMBEDDING_CACHE) > _QUERY_EMBEDDING_CACHE_SIZE:
             _QUERY_EMBEDDING_CACHE.popitem(last=False)
-    return embedding
+ 
+
+def _summarize_exception(exc: Exception, max_chars: int = 200) -> str:
+    return f"{type(exc).__name__}: {str(exc)[:max_chars]}"
 
 
 def configure_background_reindexing(
@@ -673,6 +735,21 @@ def get_live_codebase_index(
     if manager is None or manager.workspace_path != workspace_path.resolve():
         return fallback
     return manager.current_index()
+
+
+def get_background_reindex_status(workspace_path: Path) -> dict[str, object]:
+    with _BACKGROUND_REINDEX_LOCK:
+        manager = _BACKGROUND_REINDEX_MANAGER
+    if manager is None or manager.workspace_path != workspace_path.resolve():
+        return {
+            "enabled": False,
+            "workspace_path": str(workspace_path.resolve()),
+            "last_success_ns": 0,
+            "last_error": "",
+            "last_error_ns": 0,
+            "consecutive_failures": 0,
+        }
+    return manager.current_status()
 
 
 def stop_background_reindexing(workspace_path: Path | None = None) -> None:

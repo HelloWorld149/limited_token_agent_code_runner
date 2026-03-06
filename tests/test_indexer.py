@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 from hashlib import sha1
 from pathlib import Path
 import time
@@ -354,6 +355,78 @@ class TestChunkAwareRetrieval:
             for text in captured_texts
         )
 
+    def test_embedding_population_failure_logs_warning(self, tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture) -> None:
+        _write(tmp_path / "docs" / "embedded.md", "# Embedded\n\nsemantic payload\n")
+
+        import agent.indexer as indexer_mod
+
+        class FailingEmbeddingBackend:
+            backend_name = "fake"
+            model_name = "fake-semantic"
+            dimensions = 3
+            signature = "fake:failing-populate:3"
+
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("embedding service unavailable")
+
+            def embed_query(self, text: str) -> list[float]:
+                return [1.0, 0.0, 0.0]
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_resolve_embedding_backend",
+            lambda **_: FailingEmbeddingBackend(),
+        )
+        caplog.set_level(logging.WARNING)
+
+        index = build_codebase_index(
+            tmp_path,
+            use_persistent_cache=False,
+            use_embedding_retrieval=True,
+        )
+
+        assert any("Failed to populate chunk embeddings" in record.message for record in caplog.records)
+        assert any(chunk.embedding == [] for chunk in index.chunks)
+
+    def test_query_embedding_failure_logs_warning(self, tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture) -> None:
+        _write(tmp_path / "docs" / "vehicles.md", "# Vehicles\n\nCar engine maintenance notes.\n")
+
+        import agent.indexer as indexer_mod
+
+        class FailingQueryEmbeddingBackend:
+            backend_name = "fake"
+            model_name = "fake-semantic"
+            dimensions = 3
+            signature = "fake:failing-query:3"
+
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                return [[1.0, 0.0, 0.0] for _ in texts]
+
+            def embed_query(self, text: str) -> list[float]:
+                raise RuntimeError("query embedding outage")
+
+        monkeypatch.setattr(
+            indexer_mod,
+            "_resolve_embedding_backend",
+            lambda **_: FailingQueryEmbeddingBackend(),
+        )
+        caplog.set_level(logging.WARNING)
+
+        index = build_codebase_index(
+            tmp_path,
+            use_persistent_cache=False,
+            use_embedding_retrieval=True,
+        )
+        hits = search_chunks(
+            index,
+            "automobile servicing",
+            max_results=2,
+            use_embedding_retrieval=True,
+        )
+
+        assert hits == []
+        assert any("Failed to compute query embedding" in record.message for record in caplog.records)
+
     def test_retrieve_context_uses_matching_late_chunk_not_file_prefix(self, tmp_path: Path) -> None:
         content = "\n".join(
             [
@@ -456,5 +529,74 @@ class TestChunkAwareRetrieval:
                 time.sleep(0.15)
             else:
                 raise AssertionError("background reindex did not refresh the live index in time")
+        finally:
+            stop_background_reindexing(tmp_path)
+
+    def test_background_reindex_failure_reports_health_signal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        live_file = tmp_path / "docs" / "live.md"
+        _write(live_file, "# Live\n\ninitial release notes\n")
+
+        config = AgentConfig(
+            model_name=MODEL,
+            classifier_model=MODEL,
+            subagent_model=MODEL,
+            workspace_path=tmp_path,
+            use_retrieval_subagent=False,
+            use_tool_summarizer=False,
+            use_conversation_compressor=False,
+            use_multi_hop=False,
+            background_reindex_enabled=True,
+            background_reindex_interval_seconds=0.1,
+        )
+        state = {
+            "messages": [],
+            "summary_of_knowledge": "",
+            "codebase_index": build_codebase_index(tmp_path, use_persistent_cache=False),
+            "current_intent": "QUESTION",
+            "build_state": BuildState(),
+            "turn_count": 0,
+            "last_user_input": "",
+            "_retrieved_context": "",
+            "_tool_iteration_count": 0,
+            "_turn_subagent_count": 0,
+            "_turn_debug_logs": [],
+        }
+
+        try:
+            started = index_workspace(state, config)
+            import agent.indexer as indexer_mod
+
+            caplog.set_level(logging.WARNING)
+
+            def _fail_rebuild(*args, **kwargs):
+                raise RuntimeError("background refresh unavailable")
+
+            monkeypatch.setattr(indexer_mod, "build_codebase_index", _fail_rebuild)
+            _write(live_file, "# Live\n\nupdated release notes\n")
+
+            poll_state = {
+                **state,
+                **started,
+                "last_user_input": "Where are the updated release notes described?",
+                "_turn_debug_logs": [],
+            }
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                result = retrieve_context(poll_state, config)
+                if any(
+                    "background_reindex.health" in entry and "background refresh unavailable" in entry
+                    for entry in result.get("_turn_debug_logs", [])
+                ):
+                    assert any("Background reindex failed" in record.message for record in caplog.records)
+                    break
+                time.sleep(0.15)
+            else:
+                raise AssertionError("background reindex failure health signal was not surfaced in time")
         finally:
             stop_background_reindexing(tmp_path)
