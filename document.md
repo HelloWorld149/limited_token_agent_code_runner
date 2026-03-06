@@ -1,7 +1,7 @@
 # DOCUMENTATION — Context-Constrained AI Codebase Assistant
 
 > **Complete Technical Reference**
-> Last updated: 2026-03-05
+> Last updated: 2026-03-06
 
 ---
 
@@ -108,11 +108,12 @@ Two LangGraph `StateGraph` instances are compiled:
    - Runs once at startup
 
 2. **Turn Graph** (`build_turn_graph`):
-   - Nodes: `classify_and_prepare`, `retrieve_context`, `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `execute_tools` (ToolNode), `handle_tool_result`, `continue_or_respond`
+   - Nodes: `classify_and_prepare`, `retrieve_context`, `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `execute_tools` (ToolNode), `handle_tool_result`, `continue_or_respond`, `handle_exit`
    - Conditional edges route by intent and by LLM output (tool calls vs. final text)
    - The ReAct loop: `LLM node → route_after_llm → execute_tools → handle_tool_result → continue_or_respond → route_after_llm → ...`
    - All four intent handlers share the same ReAct tool loop via `route_after_llm`
    - `max_tool_iterations` (default 3) enforces a cap; once reached, `continue_or_respond` invokes the LLM without tool bindings to force a text response
+   - Module-level compiled graphs `turn_graph` and `init_graph` are exported for LangGraph Studio, and [langgraph.json](langgraph.json) points to those symbols
 
 ### 2.3 Sub-Agent System
 
@@ -132,10 +133,11 @@ Sub-agents are **separate LLM calls** outside the main 5000-token budget. Each h
 ### 3.1 Hard Invariant
 
 ```
+Default budget split:
 input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
 ```
 
-- Enforced in `AgentConfig.__post_init__()` — raises `ValueError` if violated
+- Enforced in `AgentConfig.__post_init__()` — `input_token_budget + output_token_budget` must be `<= token_budget`
 - `token_budget` must be exactly 5000 — validated at construction
 - Output is further capped to 800 tokens via `effective_output_budget` property to leave formatting headroom
 
@@ -270,9 +272,14 @@ input_token_budget (4000) + output_token_budget (1000) = token_budget (5000)
   - `answer_question`, `run_build`, `run_tests`, `explore_codebase`, `continue_or_respond` → `route_after_llm` → either `execute_tools` or `END` (respond_to_user)
   - `execute_tools → handle_tool_result → continue_or_respond` (loops back)
 
+**Module exports for LangGraph tooling:**
+- `turn_graph = build_turn_graph(_default_config)`
+- `init_graph = build_init_graph(_default_config)`
+- [langgraph.json](langgraph.json) maps those exported symbols for `langgraph dev` / LangGraph Studio
+
 ### 4.5 `agent/nodes.py`
 
-**Graph node functions, routers, LLM invocation, and helpers.** (783 lines)
+**Graph node functions, routers, LLM invocation, and helpers.** (785 lines)
 
 **Nodes:**
 
@@ -736,8 +743,8 @@ Run a shell command via `subprocess.run(shell=True)`. Output format:
 ```
 command=<normalized_cmd>
 result=PASS|FAIL (exit_code=N)
-[tests=X% passed, Y failed out of Z]  # if CTest detected
-[error_hint=<first error line>]        # if non-zero exit
+tests=X% passed, Y failed out of Z    # if CTest detected
+error_hint=<first error line>         # if non-zero exit
 [cmd]=<cmd>
 [exit_code]=N
 [stdout]
@@ -833,6 +840,8 @@ Located in `tests/`. Run with:
 pytest tests/ -v
 ```
 
+**Latest validation snapshot:** Local run on March 6, 2026 returned `117 passed, 1 skipped in 4.52s`.
+
 | Test File | Coverage |
 |---|---|
 | `test_config.py` | `AgentConfig` default construction, frozen immutability, budget invariant validation, `token_budget == 5000` enforcement, `effective_output_budget` cap |
@@ -920,13 +929,15 @@ python-dotenv>=1.0.1     — .env file loading
 
 ```
 main.py                     # REPL entry point
+generate_report.py          # Utility script that renders report.md-style content into a Word document
+langgraph.json              # LangGraph Studio/dev graph entrypoints (`turn_graph`, `init_graph`)
 agent/
   __init__.py               # Package exports: build_init_graph, build_turn_graph, AgentConfig
   config.py                 # AgentConfig — frozen dataclass, env var overrides, budget validation
   state.py                  # AgentState (TypedDict), BuildState, FileEntry, SymbolEntry, CodebaseIndex
-  graph.py                  # LangGraph StateGraph definitions (init + per-turn)
-  nodes.py                  # Graph nodes, routers, LLM invocation, environment probing, build state tracking
-  intent.py                 # Intent classifier (async LLM + keyword fallback) + follow-up classifier
+   graph.py                  # LangGraph StateGraph definitions (init + per-turn)
+   nodes.py                  # Graph nodes, routers, LLM invocation, environment probing, build state tracking
+   intent.py                 # Context-aware intent classifier + legacy follow-up utility helpers
   indexer.py                # Codebase indexer (file manifest, symbols, purpose map, search, fuzzy matching)
   tools.py                  # LangChain tools: execute_shell_command, list_directory, read_file_chunk, search_codebase
   prompts.py                # Intent-specific system prompts (QUESTION, COMPILE, RUN, EXPLORE)
@@ -944,6 +955,7 @@ tests/
 requirements.txt            # Python dependencies
 README.md                   # Project overview and usage guide
 document.md                 # This file — comprehensive technical reference
+report.md                   # Narrative technical report used as the source for stakeholder-facing output
 workspace/json/             # Pre-downloaded nlohmann/json codebase (not agent source)
 logs/                       # Runtime logs directory
 ```

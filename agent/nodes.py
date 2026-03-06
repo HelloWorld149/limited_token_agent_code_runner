@@ -8,20 +8,24 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 
 from agent.config import AgentConfig
 from agent.indexer import (
     build_codebase_index,
     detect_directory_references,
     detect_file_references,
+    expand_chunk_window,
+    format_file_outline,
     format_file_manifest_summary,
+    get_file_chunks,
+    search_chunks,
     search_index,
 )
 from agent.intent import classify_intent_sync
 from agent.model_utils import build_chat_model, normalize_ai_message
 from agent.prompts import INTENT_PROMPT_MAP
-from agent.state import AgentState, BuildState, CodebaseIndex, FileEntry, SymbolEntry
+from agent.state import AgentState, BuildState, ChunkEntry, CodebaseIndex, FileEntry, SymbolEntry
 from agent.subagents import (
     conversation_compressor_sync,
     is_complex_question,
@@ -71,7 +75,8 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     summary = (
         f"Workspace: {ws.resolve()} | "
-        f"Files: {len(index.files)} | Symbols: {len(index.symbols)} | "
+        f"Files: {len(index.files)} | Symbols: {len(index.symbols)} | Chunks: {len(index.chunks)} | "
+        f"Repo: {index.repository_summary} | "
         + " | ".join(env_facts)
     )
 
@@ -139,7 +144,7 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
 
         # Collect last few messages as text for the compressor
         recent_text_parts: list[str] = []
-        for msg in messages[-6:]:  # last ~3 turns (human + AI pairs)
+        for msg in messages[-6:]:  
             role = getattr(msg, "type", "unknown")
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             recent_text_parts.append(f"[{role}]: {content[:300]}")
@@ -168,124 +173,109 @@ def classify_and_prepare(state: AgentState, config: AgentConfig) -> dict[str, An
 # ===================================================================
 
 def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
-    """Three-layer retrieval: path-aware direct load -> keyword search -> (tool fallback via ReAct).
+    """Chunk-aware retrieval: file outlines -> semantic chunk search -> tool fallback.
 
-    Layer 1: Detect explicit file paths/names in user input and load directly.
-    Layer 2: Enhanced keyword + symbol search with fuzzy path matching.
-    Layer 3 is handled by the ReAct tool loop in the LLM nodes (all intents have tools).
-
-    When the retrieval subagent is enabled, raw code chunks are read with a LARGER
-    budget (~3000 tokens) and then compressed by a subagent into a dense digest
-    (~400 tokens). This frees up ~1400 tokens in the main context for reasoning.
+    Large files are retrieved through cached semantic chunks with line provenance,
+    not whole-file prefixes. File outlines provide map-level context, chunk search
+    provides evidence-bearing code, and adjacent chunk expansion captures answers
+    that span section boundaries.
     """
     user_input = state.get("last_user_input", "")
     index = state.get("codebase_index", CodebaseIndex())
-    intent = state.get("current_intent", "QUESTION")
 
     raw_code_chunks: list[str] = []
-    ws = config.workspace_path
     debug_logs = list(state.get("_turn_debug_logs", []))
     turn_subagent_count = int(state.get("_turn_subagent_count", 0))
+    file_lookup = {file_entry.path: file_entry for file_entry in index.files}
 
-    # When using retrieval subagent, read MORE raw code because the subagent
-    # will compress it. Without subagent, use the original tight budget.
     if config.use_retrieval_subagent:
-        token_budget_for_raw = 3000  # subagent compresses to ~400 tokens
+        token_budget_for_raw = 3000
     else:
-        token_budget_for_raw = 1800  # goes directly into main context
+        token_budget_for_raw = 1800
 
     tokens_used = 0
-    seen_files: set[str] = set()
-    direct_loaded = 0
+    seen_chunk_keys: set[tuple[str, int, int]] = set()
+    outline_loaded = 0
+    direct_chunk_loaded = 0
     search_loaded = 0
 
-    # ---------------------------------------------------------------
-    # Layer 1: Path-aware direct retrieval
-    # ---------------------------------------------------------------
     referenced_files = detect_file_references(user_input, index)
     dir_files = detect_directory_references(user_input, index)
-    direct_files = referenced_files + [f for f in dir_files if f.path not in {r.path for r in referenced_files}]
+    direct_files = referenced_files + [
+        file_entry for file_entry in dir_files
+        if file_entry.path not in {ref.path for ref in referenced_files}
+    ]
+    direct_paths = {file_entry.path for file_entry in direct_files}
 
-    for fe in direct_files:
-        if fe.path in seen_files:
-            continue
-        seen_files.add(fe.path)
+    if len(direct_files) > 8:
+        debug_logs.append(f"retrieve.direct_files_truncated={len(direct_files)}")
 
-        filepath = ws / fe.path
-        if not filepath.exists() or not filepath.is_file():
-            continue
-
-        try:
-            content = filepath.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-
-        lines = content.splitlines()
-        max_lines = min(80, len(lines))
-        chunk = "\n".join(lines[:max_lines])
-
-        chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-        if tokens_used + chunk_tokens > token_budget_for_raw:
-            max_lines = min(30, len(lines))
-            chunk = "\n".join(lines[:max_lines])
-            chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-            if tokens_used + chunk_tokens > token_budget_for_raw:
-                continue
-
-        purpose_tag = f" [{fe.purpose}]" if fe.purpose else ""
-        raw_code_chunks.append(
-            f"--- {fe.path} (lines 1-{max_lines}){purpose_tag} ---\n{chunk}"
+    for file_entry in direct_files[:8]:
+        outline = format_file_outline(index, file_entry, max_chunks=6 if len(direct_files) <= 3 else 3)
+        new_total = _append_raw_context(
+            raw_code_chunks=raw_code_chunks,
+            text=f"--- File Outline: {file_entry.path} ---\n{outline}",
+            model_name=config.model_name,
+            token_budget=token_budget_for_raw,
+            tokens_used=tokens_used,
         )
-        tokens_used += chunk_tokens
-        direct_loaded += 1
+        if new_total != tokens_used:
+            tokens_used = new_total
+            outline_loaded += 1
 
-    # ---------------------------------------------------------------
-    # Layer 2: Enhanced keyword + symbol search (fills remaining budget)
-    # ---------------------------------------------------------------
+    direct_seed_chunks: list[ChunkEntry] = []
+    for file_entry in direct_files[:4]:
+        local_hits = search_chunks(index, user_input, max_results=2, allowed_files={file_entry.path})
+        if not local_hits:
+            local_hits = get_file_chunks(index, file_entry.path)[:2]
+        direct_seed_chunks.extend(local_hits[:2])
+
+    for chunk in expand_chunk_window(index, _dedupe_chunks(direct_seed_chunks), neighbor_depth=1, max_chunks=10):
+        chunk_key = (chunk.file_path, chunk.start_line, chunk.end_line)
+        if chunk_key in seen_chunk_keys:
+            continue
+        new_total = _append_raw_context(
+            raw_code_chunks=raw_code_chunks,
+            text=_format_chunk_context(chunk, file_lookup.get(chunk.file_path)),
+            model_name=config.model_name,
+            token_budget=token_budget_for_raw,
+            tokens_used=tokens_used,
+        )
+        if new_total == tokens_used:
+            continue
+        seen_chunk_keys.add(chunk_key)
+        tokens_used = new_total
+        direct_chunk_loaded += 1
+
     if tokens_used < token_budget_for_raw - 200:
-        results = search_index(index, user_input, max_results=10)
+        keyword_chunks = search_chunks(index, user_input, max_results=8)
+        if not keyword_chunks:
+            keyword_chunks = _chunks_from_search_results(index, search_index(index, user_input, max_results=8))
 
-        files_to_read: list[tuple[str, int]] = []
-        for item in results:
-            if isinstance(item, SymbolEntry):
-                files_to_read.append((item.file, item.line))
-            elif isinstance(item, FileEntry):
-                files_to_read.append((item.path, 1))
+        expanded_keyword_chunks = expand_chunk_window(
+            index,
+            [chunk for chunk in keyword_chunks if chunk.file_path not in direct_paths],
+            neighbor_depth=1,
+            max_chunks=12,
+        )
 
-        for rel_path, line in files_to_read:
-            if rel_path in seen_files:
+        for chunk in expanded_keyword_chunks:
+            chunk_key = (chunk.file_path, chunk.start_line, chunk.end_line)
+            if chunk_key in seen_chunk_keys:
                 continue
-            seen_files.add(rel_path)
-
-            filepath = ws / rel_path
-            if not filepath.exists() or not filepath.is_file():
+            new_total = _append_raw_context(
+                raw_code_chunks=raw_code_chunks,
+                text=_format_chunk_context(chunk, file_lookup.get(chunk.file_path)),
+                model_name=config.model_name,
+                token_budget=token_budget_for_raw,
+                tokens_used=tokens_used,
+            )
+            if new_total == tokens_used:
                 continue
-
-            try:
-                content = filepath.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-
-            lines_list = content.splitlines()
-            start = max(0, line - 5)
-            end = min(len(lines_list), line + 40)
-            chunk = "\n".join(lines_list[start:end])
-
-            chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-            if tokens_used + chunk_tokens > token_budget_for_raw:
-                end = min(len(lines_list), line + 15)
-                chunk = "\n".join(lines_list[start:end])
-                chunk_tokens = estimate_text_tokens(chunk, config.model_name)
-                if tokens_used + chunk_tokens > token_budget_for_raw:
-                    continue
-
-            raw_code_chunks.append(f"--- {rel_path} (lines {start+1}-{end}) ---\n{chunk}")
-            tokens_used += chunk_tokens
+            seen_chunk_keys.add(chunk_key)
+            tokens_used = new_total
             search_loaded += 1
 
-    # ---------------------------------------------------------------
-    # Fallback: if nothing retrieved, show file manifest
-    # ---------------------------------------------------------------
     if not raw_code_chunks:
         manifest = format_file_manifest_summary(index, max_entries=20)
         manifest = trim_text_to_token_budget(manifest, config.model_name, 800)
@@ -294,7 +284,8 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     debug_logs.append(
         "retrieve.selection "
-        f"direct={direct_loaded} keyword={search_loaded} chunks={len(raw_code_chunks)} "
+        f"outlines={outline_loaded} direct_chunks={direct_chunk_loaded} keyword_chunks={search_loaded} "
+        f"items={len(raw_code_chunks)} "
         f"tokens={tokens_used}/{token_budget_for_raw}"
     )
 
@@ -305,27 +296,15 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     # ---------------------------------------------------------------
     if config.use_retrieval_subagent and raw_code_chunks:
         if config.use_multi_hop and is_complex_question(user_input):
-            # Multi-hop: decompose -> parallel investigate -> merge
-            # Creates an index search helper so each sub-query can find
-            # its own targeted code chunks
             def _index_search_for_subquery(sub_query: str) -> list[str]:
-                sub_results = search_index(index, sub_query, max_results=5)
-                chunks: list[str] = []
-                for item in sub_results:
-                    rel_path = item.file if isinstance(item, SymbolEntry) else item.path
-                    line = item.line if isinstance(item, SymbolEntry) else 1
-                    fp = ws / rel_path
-                    if not fp.exists() or not fp.is_file():
-                        continue
-                    try:
-                        content = fp.read_text(encoding="utf-8", errors="ignore")
-                    except OSError:
-                        continue
-                    lines_list = content.splitlines()
-                    s = max(0, line - 5)
-                    e = min(len(lines_list), line + 40)
-                    chunks.append(f"--- {rel_path} (lines {s+1}-{e}) ---\n" + "\n".join(lines_list[s:e]))
-                return chunks if chunks else raw_code_chunks
+                sub_results = search_chunks(index, sub_query, max_results=5)
+                if not sub_results:
+                    sub_results = _chunks_from_search_results(index, search_index(index, sub_query, max_results=5))
+                formatted = [
+                    _format_chunk_context(chunk, file_lookup.get(chunk.file_path))
+                    for chunk in expand_chunk_window(index, sub_results, neighbor_depth=1, max_chunks=8)
+                ]
+                return formatted if formatted else raw_code_chunks
 
             multi_hop_result = multi_hop_decomposer_sync(
                 user_query=user_input,
@@ -376,6 +355,88 @@ def retrieve_context(state: AgentState, config: AgentConfig) -> dict[str, Any]:
         "_turn_subagent_count": turn_subagent_count,
         "_turn_debug_logs": debug_logs,
     }
+
+
+def _append_raw_context(
+    raw_code_chunks: list[str],
+    text: str,
+    model_name: str,
+    token_budget: int,
+    tokens_used: int,
+) -> int:
+    """Append retrieval context while respecting the raw retrieval token budget."""
+    remaining = token_budget - tokens_used
+    if remaining <= 80:
+        return tokens_used
+
+    item_tokens = estimate_text_tokens(text, model_name)
+    if item_tokens <= remaining:
+        raw_code_chunks.append(text)
+        return tokens_used + item_tokens
+
+    trimmed = trim_text_to_token_budget(text, model_name, remaining)
+    if not trimmed.strip():
+        return tokens_used
+
+    trimmed_tokens = estimate_text_tokens(trimmed, model_name)
+    if trimmed_tokens <= 0:
+        return tokens_used
+
+    raw_code_chunks.append(trimmed)
+    return tokens_used + trimmed_tokens
+
+
+def _format_chunk_context(chunk: ChunkEntry, file_entry: FileEntry | None) -> str:
+    purpose_tag = f" [{file_entry.purpose}]" if file_entry and file_entry.purpose else ""
+    heading_tag = f" | heading={chunk.heading}" if chunk.heading else ""
+    symbols = ", ".join(chunk.symbol_names[:5])
+    symbols_tag = f" | symbols={symbols}" if symbols else ""
+    return (
+        f"--- {chunk.file_path} (lines {chunk.start_line}-{chunk.end_line})"
+        f"{purpose_tag}{heading_tag}{symbols_tag} ---\n"
+        f"{chunk.text}"
+    )
+
+
+def _chunks_from_search_results(
+    index: CodebaseIndex,
+    results: list[FileEntry | SymbolEntry],
+) -> list[ChunkEntry]:
+    chunks: list[ChunkEntry] = []
+    for item in results:
+        if isinstance(item, SymbolEntry):
+            chunk = _find_chunk_for_line(index, item.file, item.line)
+            if chunk is not None:
+                chunks.append(chunk)
+        elif isinstance(item, FileEntry):
+            file_chunks = get_file_chunks(index, item.path)
+            if file_chunks:
+                chunks.append(file_chunks[0])
+    return _dedupe_chunks(chunks)
+
+
+def _find_chunk_for_line(
+    index: CodebaseIndex,
+    rel_path: str,
+    line: int,
+) -> ChunkEntry | None:
+    for chunk in get_file_chunks(index, rel_path):
+        if chunk.start_line <= line <= chunk.end_line:
+            return chunk
+    file_chunks = get_file_chunks(index, rel_path)
+    return file_chunks[0] if file_chunks else None
+
+
+def _dedupe_chunks(chunks: list[ChunkEntry]) -> list[ChunkEntry]:
+    deduped: list[ChunkEntry] = []
+    seen: set[tuple[str, int, int]] = set()
+    for chunk in chunks:
+        key = (chunk.file_path, chunk.start_line, chunk.end_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(chunk)
+    return deduped
 
 
 # ===================================================================

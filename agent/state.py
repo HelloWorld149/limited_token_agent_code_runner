@@ -41,9 +41,25 @@ class FileEntry:
     path: str
     language: str
     size: int
-    summary: str  # first-line / short description
+    summary: str  # file-level summary built from chunk summaries
     purpose: str = ""  # computed: module type, key exports, architectural role
     declarations: list[str] = field(default_factory=list)  # top-level class/function/module declarations
+    chunk_count: int = 0
+
+
+@dataclass
+class ChunkEntry:
+    """Semantic chunk metadata used for chunk-level retrieval."""
+
+    file_path: str
+    language: str
+    start_line: int
+    end_line: int
+    summary: str
+    heading: str = ""
+    symbol_names: list[str] = field(default_factory=list)
+    declarations: list[str] = field(default_factory=list)
+    text: str = ""
 
 
 @dataclass
@@ -61,6 +77,9 @@ class CodebaseIndex:
     root: str = ""
     files: list[FileEntry] = field(default_factory=list)
     symbols: list[SymbolEntry] = field(default_factory=list)
+    chunks: list[ChunkEntry] = field(default_factory=list)
+    chunks_by_file: dict[str, list[int]] = field(default_factory=dict)
+    repository_summary: str = ""
 
 
 # ---------------------------------------------------------------------------
