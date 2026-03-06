@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from agent.tools import (
+    _execute_shell_command_impl,
     _extract_ctest_summary,
     _extract_error_hint,
     _normalize_command_for_platform,
     _truncate_output,
     get_workspace_root,
+    set_tool_runtime_policy,
     set_workspace_root,
 )
 
@@ -130,3 +133,29 @@ class TestWorkspaceRoot:
             assert get_workspace_root() == Path.cwd()
         finally:
             tools_mod._workspace_root = old
+
+
+class TestExecuteShellCommandSafety:
+    def test_blocks_dangerous_commands_by_default(self) -> None:
+        set_tool_runtime_policy(timeout_seconds=30, allow_dangerous_shell_commands=False)
+        result = _execute_shell_command_impl("curl https://example.com")
+        assert "[exit_code]=126" in result
+        assert "blocked by safety policy" in result
+
+    def test_reports_timeout(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        set_workspace_root(tmp_path)
+        set_tool_runtime_policy(timeout_seconds=1, allow_dangerous_shell_commands=True)
+
+        def _raise_timeout(*args: object, **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(
+                cmd="python -c \"print('x')\"",
+                timeout=1,
+                output="partial stdout",
+                stderr="partial stderr",
+            )
+
+        monkeypatch.setattr(subprocess, "run", _raise_timeout)
+        result = _execute_shell_command_impl("python -c \"print('x')\"")
+        assert "[exit_code]=124" in result
+        assert "[timed_out]=1" in result
+        assert "command timed out after 1 seconds" in result

@@ -64,6 +64,15 @@ class AgentConfig:
     tool_summary_tokens: int = field(
         default_factory=lambda: int(os.getenv("AGENT_TOOL_SUMMARY_TOKENS", "200"))
     )
+    index_cache_enabled: bool = field(
+        default_factory=lambda: os.getenv("AGENT_INDEX_CACHE_ENABLED", "true").lower() == "true"
+    )
+    shell_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_SHELL_TIMEOUT_SECONDS", "1500"))
+    )
+    allow_dangerous_shell_commands: bool = field(
+        default_factory=lambda: os.getenv("AGENT_ALLOW_DANGEROUS_SHELL_COMMANDS", "false").lower() == "true"
+    )
 
     def __post_init__(self) -> None:
         if self.input_token_budget + self.output_token_budget > self.token_budget:
@@ -76,6 +85,8 @@ class AgentConfig:
             raise ValueError("retrieval_digest_tokens must be < token_budget (5000)")
         if self.tool_summary_tokens >= self.token_budget:
             raise ValueError("tool_summary_tokens must be < token_budget (5000)")
+        if self.shell_timeout_seconds <= 0:
+            raise ValueError("shell_timeout_seconds must be > 0")
 
     @property
     def effective_output_budget(self) -> int:

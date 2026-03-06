@@ -36,3 +36,13 @@ class TestAgentConfig:
         config = AgentConfig()
         assert config.effective_output_budget <= config.output_token_budget
         assert config.effective_output_budget == min(config.output_token_budget, 800)
+
+    def test_new_production_defaults(self) -> None:
+        config = AgentConfig()
+        assert config.index_cache_enabled is True
+        assert config.shell_timeout_seconds > 0
+        assert config.allow_dangerous_shell_commands is False
+
+    def test_shell_timeout_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="shell_timeout_seconds must be > 0"):
+            AgentConfig(shell_timeout_seconds=0)

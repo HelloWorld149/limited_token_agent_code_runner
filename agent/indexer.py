@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gzip
+import json
 import os
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
 
@@ -52,7 +55,10 @@ SKIP_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".ico",
 }
 
-_MAX_INDEX_FILE_BYTES = 2_000_000
+_INDEX_CACHE_VERSION = 2
+_INDEX_CACHE_FILE_NAME = ".codebase_index_cache_v2.json.gz"
+_MAX_INDEX_FILE_BYTES = 25_000_000
+_STREAMING_INDEX_THRESHOLD_BYTES = 2_000_000
 _MAX_SYMBOL_SCAN_BYTES = 1_500_000
 _MIN_CHUNK_LINES = 24
 
@@ -115,7 +121,10 @@ _BRIEF_RE = re.compile(r"(?:@brief|\\brief)\s+(.+)", re.MULTILINE)
 _CPP_FALSE_POSITIVES = {"if", "for", "while", "switch", "return", "catch", "sizeof", "alignof"}
 
 
-def build_codebase_index(workspace_path: Path) -> CodebaseIndex:
+def build_codebase_index(
+    workspace_path: Path,
+    use_persistent_cache: bool = True,
+) -> CodebaseIndex:
     """Walk the workspace and build file, symbol, chunk, and summary indexes."""
     root = str(workspace_path.resolve())
     files: list[FileEntry] = []
@@ -123,70 +132,56 @@ def build_codebase_index(workspace_path: Path) -> CodebaseIndex:
     chunks: list[ChunkEntry] = []
     chunks_by_file: dict[str, list[int]] = {}
 
-    for dirpath, dirnames, filenames in os.walk(workspace_path):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+    cached_records = _load_cached_records(workspace_path) if use_persistent_cache else {}
+    records_to_cache: dict[str, dict[str, object]] = {}
 
-        for filename in filenames:
-            filepath = Path(dirpath) / filename
-            ext = filepath.suffix.lower()
+    for filepath in _iter_workspace_files(workspace_path):
+        ext = filepath.suffix.lower()
+        lang = _LANG_MAP.get(ext, "other")
 
-            if ext in SKIP_EXTENSIONS:
-                continue
+        try:
+            stat = filepath.stat()
+        except OSError:
+            continue
 
-            try:
-                stat = filepath.stat()
-            except OSError:
-                continue
+        if stat.st_size > _MAX_INDEX_FILE_BYTES:
+            continue
 
-            if stat.st_size > _MAX_INDEX_FILE_BYTES:
-                continue
-
-            lang = _LANG_MAP.get(ext, "other")
-
-            try:
-                content = filepath.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                content = ""
-
-            rel_path = str(filepath.relative_to(workspace_path)).replace("\\", "/")
-            purpose = _detect_file_purpose(content, filepath, lang)
-            file_chunks = _chunk_file_content(rel_path, content, lang)
-            declarations = _collect_file_declarations(file_chunks, content, lang)
-            summary = _build_file_summary(
-                file_chunks=file_chunks,
-                content=content,
+        rel_path = str(filepath.relative_to(workspace_path)).replace("\\", "/")
+        fingerprint = _file_fingerprint(stat)
+        cached_record = cached_records.get(rel_path)
+        if cached_record is not None and cached_record.get("fingerprint") == fingerprint:
+            file_entry, file_chunks, file_symbols = _deserialize_cached_record(cached_record)
+        else:
+            file_entry, file_chunks, file_symbols = _index_single_file(
                 filepath=filepath,
+                rel_path=rel_path,
+                stat=stat,
                 lang=lang,
-                purpose=purpose,
-                declarations=declarations,
             )
+        records_to_cache[rel_path] = _serialize_cached_record(
+            fingerprint=fingerprint,
+            file_entry=file_entry,
+            file_chunks=file_chunks,
+            file_symbols=file_symbols,
+        )
+        files.append(file_entry)
+        symbols.extend(file_symbols)
 
-            chunk_indexes: list[int] = []
-            for chunk in file_chunks:
-                chunk_indexes.append(len(chunks))
-                chunks.append(chunk)
-            if chunk_indexes:
-                chunks_by_file[rel_path] = chunk_indexes
+        chunk_indexes: list[int] = []
+        for chunk in file_chunks:
+            chunk_indexes.append(len(chunks))
+            chunks.append(chunk)
+        if chunk_indexes:
+            chunks_by_file[rel_path] = chunk_indexes
 
-            files.append(
-                FileEntry(
-                    path=rel_path,
-                    language=lang,
-                    size=stat.st_size,
-                    summary=summary,
-                    purpose=purpose,
-                    declarations=declarations,
-                    chunk_count=len(file_chunks),
-                )
-            )
-
-            if content and stat.st_size <= _MAX_SYMBOL_SCAN_BYTES:
-                if lang in ("c++", "c"):
-                    _extract_symbols_from_content(content, rel_path, symbols)
-                elif lang == "python":
-                    _extract_python_symbols_from_content(content, rel_path, symbols)
-
+    files.sort(key=lambda file_entry: file_entry.path)
+    symbols.sort(key=lambda symbol: (symbol.file, symbol.line, symbol.name))
     repository_summary = _build_repository_summary(files)
+
+    if use_persistent_cache:
+        _save_cached_records(workspace_path, repository_summary, records_to_cache)
+
     return CodebaseIndex(
         root=root,
         files=files,
@@ -195,6 +190,197 @@ def build_codebase_index(workspace_path: Path) -> CodebaseIndex:
         chunks_by_file=chunks_by_file,
         repository_summary=repository_summary,
     )
+
+
+def _iter_workspace_files(workspace_path: Path) -> Iterable[Path]:
+    for dirpath, dirnames, filenames in os.walk(workspace_path):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for filename in sorted(filenames):
+            if filename == _INDEX_CACHE_FILE_NAME:
+                continue
+            filepath = Path(dirpath) / filename
+            if filepath.suffix.lower() in SKIP_EXTENSIONS:
+                continue
+            yield filepath
+
+
+def _cache_file_path(workspace_path: Path) -> Path:
+    return workspace_path / _INDEX_CACHE_FILE_NAME
+
+
+def _file_fingerprint(stat: os.stat_result) -> dict[str, int]:
+    return {
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    }
+
+
+def _load_cached_records(workspace_path: Path) -> dict[str, dict[str, object]]:
+    cache_path = _cache_file_path(workspace_path)
+    if not cache_path.exists():
+        return {}
+
+    try:
+        with gzip.open(cache_path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if payload.get("version") != _INDEX_CACHE_VERSION:
+        return {}
+
+    records = payload.get("records")
+    if not isinstance(records, dict):
+        return {}
+    return {str(path): record for path, record in records.items() if isinstance(record, dict)}
+
+
+def _save_cached_records(
+    workspace_path: Path,
+    repository_summary: str,
+    records: dict[str, dict[str, object]],
+) -> None:
+    cache_path = _cache_file_path(workspace_path)
+    payload = {
+        "version": _INDEX_CACHE_VERSION,
+        "repository_summary": repository_summary,
+        "records": records,
+    }
+    try:
+        with gzip.open(cache_path, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+    except OSError:
+        return
+
+
+def _serialize_cached_record(
+    fingerprint: dict[str, int],
+    file_entry: FileEntry,
+    file_chunks: list[ChunkEntry],
+    file_symbols: list[SymbolEntry],
+) -> dict[str, object]:
+    return {
+        "fingerprint": fingerprint,
+        "file_entry": asdict(file_entry),
+        "chunks": [asdict(chunk) for chunk in file_chunks],
+        "symbols": [asdict(symbol) for symbol in file_symbols],
+    }
+
+
+def _deserialize_cached_record(
+    record: dict[str, object],
+) -> tuple[FileEntry, list[ChunkEntry], list[SymbolEntry]]:
+    raw_file_entry = record.get("file_entry") or {}
+    raw_chunks = record.get("chunks") or []
+    raw_symbols = record.get("symbols") or []
+
+    file_entry = FileEntry(**raw_file_entry)
+    file_chunks = [ChunkEntry(**chunk) for chunk in raw_chunks if isinstance(chunk, dict)]
+    file_symbols = [SymbolEntry(**symbol) for symbol in raw_symbols if isinstance(symbol, dict)]
+    return file_entry, file_chunks, file_symbols
+
+
+def _index_single_file(
+    filepath: Path,
+    rel_path: str,
+    stat: os.stat_result,
+    lang: str,
+) -> tuple[FileEntry, list[ChunkEntry], list[SymbolEntry]]:
+    if stat.st_size >= _STREAMING_INDEX_THRESHOLD_BYTES:
+        return _index_large_text_file(filepath, rel_path, stat, lang)
+
+    try:
+        content = filepath.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        content = ""
+
+    purpose = _detect_file_purpose(content, filepath, lang)
+    file_chunks = _chunk_file_content(rel_path, content, lang)
+    declarations = _collect_file_declarations(file_chunks, content, lang)
+    summary = _build_file_summary(
+        file_chunks=file_chunks,
+        content=content,
+        filepath=filepath,
+        lang=lang,
+        purpose=purpose,
+        declarations=declarations,
+    )
+
+    file_entry = FileEntry(
+        path=rel_path,
+        language=lang,
+        size=stat.st_size,
+        summary=summary,
+        purpose=purpose,
+        declarations=declarations,
+        chunk_count=len(file_chunks),
+    )
+
+    file_symbols: list[SymbolEntry] = []
+    if content and stat.st_size <= _MAX_SYMBOL_SCAN_BYTES:
+        if lang in ("c++", "c"):
+            _extract_symbols_from_content(content, rel_path, file_symbols)
+        elif lang == "python":
+            _extract_python_symbols_from_content(content, rel_path, file_symbols)
+
+    return file_entry, file_chunks, file_symbols
+
+
+def _index_large_text_file(
+    filepath: Path,
+    rel_path: str,
+    stat: os.stat_result,
+    lang: str,
+) -> tuple[FileEntry, list[ChunkEntry], list[SymbolEntry]]:
+    lines = _read_text_lines_streaming(filepath)
+    content_preview = _preview_from_lines(lines)
+    purpose = _detect_file_purpose(content_preview, filepath, lang)
+    file_chunks = _chunk_lines(rel_path, lines, lang)
+    declarations = _collect_file_declarations(file_chunks, content_preview, lang)
+    summary = _build_file_summary(
+        file_chunks=file_chunks,
+        content=content_preview,
+        filepath=filepath,
+        lang=lang,
+        purpose=purpose,
+        declarations=declarations,
+    )
+
+    file_entry = FileEntry(
+        path=rel_path,
+        language=lang,
+        size=stat.st_size,
+        summary=summary,
+        purpose=purpose,
+        declarations=declarations,
+        chunk_count=len(file_chunks),
+    )
+    return file_entry, file_chunks, []
+
+
+def _read_text_lines_streaming(filepath: Path) -> list[str]:
+    lines: list[str] = []
+    try:
+        with filepath.open("r", encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                lines.append(raw_line.rstrip("\n\r"))
+    except OSError:
+        return []
+    return lines
+
+
+def _preview_from_lines(lines: list[str], max_chars: int = 20000) -> str:
+    if not lines:
+        return ""
+
+    preview_parts: list[str] = []
+    total_chars = 0
+    for line in lines:
+        preview_parts.append(line)
+        total_chars += len(line) + 1
+        if total_chars >= max_chars:
+            break
+    return "\n".join(preview_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +393,10 @@ def _chunk_file_content(rel_path: str, content: str, lang: str) -> list[ChunkEnt
         return []
 
     lines = content.splitlines()
+    return _chunk_lines(rel_path, lines, lang)
+
+
+def _chunk_lines(rel_path: str, lines: list[str], lang: str) -> list[ChunkEntry]:
     if not lines:
         return []
 
@@ -237,6 +427,7 @@ def _chunk_file_content(rel_path: str, content: str, lang: str) -> list[ChunkEnt
         )
 
     if not chunks:
+        content = "\n".join(lines)
         summary = _build_chunk_summary(content, Path(rel_path), lang, "", [], [])
         chunks.append(
             ChunkEntry(

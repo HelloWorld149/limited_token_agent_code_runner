@@ -17,12 +17,31 @@ from agent.indexer import SKIP_DIRS, SKIP_EXTENSIONS
 # working directory is changed externally.
 # ---------------------------------------------------------------------------
 _workspace_root: Path | None = None
+_TOOL_TIMEOUT_SECONDS = 120
+_ALLOW_DANGEROUS_SHELL_COMMANDS = False
+
+_BLOCKED_COMMAND_PATTERNS = [
+    re.compile(r"(^|[\s;&|])(curl|wget|Invoke-WebRequest|iwr)\b", re.IGNORECASE),
+    re.compile(r"(^|[\s;&|])(git\s+clone|scp|ssh|sftp|ftp)\b", re.IGNORECASE),
+    re.compile(r"(^|[\s;&|])(Remove-Item|del|erase|rmdir\s+/s|rm\s+-rf|format|diskpart|shutdown|restart-computer)\b", re.IGNORECASE),
+    re.compile(r"(^|[\s;&|])(Start-Process\s+powershell|powershell\s+-|cmd\s+/c\s+del)\b", re.IGNORECASE),
+]
 
 
 def set_workspace_root(path: Path) -> None:
     """Set the workspace root used by search_codebase and other tools."""
     global _workspace_root
     _workspace_root = path.resolve()
+
+
+def set_tool_runtime_policy(
+    timeout_seconds: int = 120,
+    allow_dangerous_shell_commands: bool = False,
+) -> None:
+    """Configure command execution safety policy for shell-backed tools."""
+    global _TOOL_TIMEOUT_SECONDS, _ALLOW_DANGEROUS_SHELL_COMMANDS
+    _TOOL_TIMEOUT_SECONDS = max(1, int(timeout_seconds))
+    _ALLOW_DANGEROUS_SHELL_COMMANDS = allow_dangerous_shell_commands
 
 
 def get_workspace_root() -> Path:
@@ -106,6 +125,116 @@ def _normalize_command_for_platform(cmd: str) -> str:
     return normalized
 
 
+def _validate_command_policy(cmd: str) -> str | None:
+    """Reject obviously dangerous or out-of-scope commands unless explicitly allowed."""
+    if _ALLOW_DANGEROUS_SHELL_COMMANDS:
+        return None
+
+    stripped = cmd.strip()
+    if not stripped:
+        return "empty command"
+
+    for pattern in _BLOCKED_COMMAND_PATTERNS:
+        if pattern.search(stripped):
+            return "command blocked by safety policy"
+    return None
+
+
+def _build_tool_env() -> dict[str, str]:
+    """Provide a minimal, stable environment for build and test commands."""
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("CLICOLOR", "0")
+    return env
+
+
+def _format_command_result(
+    normalized_cmd: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    timed_out: bool = False,
+) -> str:
+    status = "PASS" if exit_code == 0 and not timed_out else "FAIL"
+    ctest_summary = _extract_ctest_summary(stdout, stderr)
+    error_hint = _extract_error_hint(stdout, stderr)
+
+    metadata: list[str] = [
+        f"command={normalized_cmd}",
+        f"result={status} (exit_code={exit_code})",
+    ]
+    if timed_out:
+        metadata.append(f"timed_out=true (timeout_seconds={_TOOL_TIMEOUT_SECONDS})")
+    if ctest_summary:
+        metadata.append(f"tests={ctest_summary}")
+    if exit_code != 0 and error_hint:
+        metadata.append(f"error_hint={error_hint}")
+
+    combined = (
+        "\n".join(metadata)
+        + "\n"
+        f"[cmd]={normalized_cmd}\n"
+        f"[exit_code]={exit_code}\n"
+        f"[timed_out]={1 if timed_out else 0}\n"
+        f"[stdout]\n{stdout}\n"
+        f"[stderr]\n{stderr}"
+    )
+    return _truncate_output(combined)
+
+
+def _execute_shell_command_impl(cmd: str) -> str:
+    normalized_cmd = _normalize_command_for_platform(cmd)
+    policy_error = _validate_command_policy(normalized_cmd)
+    if policy_error is not None:
+        return _format_command_result(
+            normalized_cmd=normalized_cmd,
+            exit_code=126,
+            stdout="",
+            stderr=policy_error,
+            timed_out=False,
+        )
+
+    try:
+        completed = subprocess.run(
+            normalized_cmd,
+            shell=True,
+            text=True,
+            capture_output=True,
+            cwd=str(get_workspace_root()),
+            timeout=_TOOL_TIMEOUT_SECONDS,
+            env=_build_tool_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = (exc.stderr or "")
+        if stderr:
+            stderr += "\n"
+        stderr += f"command timed out after {_TOOL_TIMEOUT_SECONDS} seconds"
+        return _format_command_result(
+            normalized_cmd=normalized_cmd,
+            exit_code=124,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=True,
+        )
+    except Exception as exc:
+        return _format_command_result(
+            normalized_cmd=normalized_cmd,
+            exit_code=125,
+            stdout="",
+            stderr=f"execution error: {type(exc).__name__}: {exc}",
+            timed_out=False,
+        )
+
+    return _format_command_result(
+        normalized_cmd=normalized_cmd,
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        timed_out=False,
+    )
+
+
 def _extract_ctest_summary(stdout: str, stderr: str) -> str | None:
     text = f"{stdout}\n{stderr}"
     match = _CTEST_SUMMARY_RE.search(text)
@@ -131,35 +260,7 @@ def _extract_error_hint(stdout: str, stderr: str) -> str | None:
 @tool
 def execute_shell_command(cmd: str) -> str:
     """Run a shell command and capture both stdout and stderr with truncation logic."""
-    normalized_cmd = _normalize_command_for_platform(cmd)
-    completed = subprocess.run(
-        normalized_cmd,
-        shell=True,
-        text=True,
-        capture_output=True,
-    )
-    status = "PASS" if completed.returncode == 0 else "FAIL"
-    ctest_summary = _extract_ctest_summary(completed.stdout, completed.stderr)
-    error_hint = _extract_error_hint(completed.stdout, completed.stderr)
-
-    metadata: list[str] = [
-        f"command={normalized_cmd}",
-        f"result={status} (exit_code={completed.returncode})",
-    ]
-    if ctest_summary:
-        metadata.append(f"tests={ctest_summary}")
-    if completed.returncode != 0 and error_hint:
-        metadata.append(f"error_hint={error_hint}")
-
-    combined = (
-        "\n".join(metadata)
-        + "\n"
-        f"[cmd]={normalized_cmd}\n"
-        f"[exit_code]={completed.returncode}\n"
-        f"[stdout]\n{completed.stdout}\n"
-        f"[stderr]\n{completed.stderr}"
-    )
-    return _truncate_output(combined)
+    return _execute_shell_command_impl(cmd)
 
 
 @tool

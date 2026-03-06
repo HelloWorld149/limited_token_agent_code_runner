@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha1
 from pathlib import Path
 
 from agent.config import AgentConfig
@@ -44,6 +45,70 @@ class TestChunkAwareIndexing:
         assert file_entry.chunk_count > 5
         assert index.repository_summary
         assert get_file_chunks(index, file_entry.path)
+
+    def test_streamed_oversized_text_file_is_indexed(self, tmp_path: Path) -> None:
+        repeated_line = "oversized semantic payload for streamed indexing coverage\n"
+        large_payload = "# Streamed Doc\n\n" + (repeated_line * 45_000)
+        target = tmp_path / "docs" / "oversized.md"
+        _write(target, large_payload)
+
+        index = build_codebase_index(tmp_path, use_persistent_cache=False)
+
+        file_entry = next(file for file in index.files if file.path == "docs/oversized.md")
+        assert file_entry.size > 2_000_000
+        assert file_entry.chunk_count > 10
+        assert get_file_chunks(index, file_entry.path)
+
+    def test_persistent_cache_reuses_unchanged_files(self, tmp_path: Path, monkeypatch) -> None:
+        _write(tmp_path / "docs" / "cached.md", "# Cached\n\nalpha\nbeta\n")
+
+        import agent.indexer as indexer_mod
+
+        original = indexer_mod._index_single_file
+        calls: list[str] = []
+
+        def wrapped(*args, **kwargs):
+            rel_path = kwargs.get("rel_path")
+            if isinstance(rel_path, str):
+                calls.append(rel_path)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(indexer_mod, "_index_single_file", wrapped)
+
+        first_index = build_codebase_index(tmp_path, use_persistent_cache=True)
+        assert any(file.path == "docs/cached.md" for file in first_index.files)
+        assert calls == ["docs/cached.md"]
+
+        calls.clear()
+        second_index = build_codebase_index(tmp_path, use_persistent_cache=True)
+        assert any(file.path == "docs/cached.md" for file in second_index.files)
+        assert calls == []
+        assert (tmp_path / ".codebase_index_cache_v2.json.gz").exists()
+
+    def test_persistent_cache_invalidates_changed_files(self, tmp_path: Path, monkeypatch) -> None:
+        target = tmp_path / "docs" / "invalidate.md"
+        _write(target, "# Version 1\n\ninitial\n")
+        build_codebase_index(tmp_path, use_persistent_cache=True)
+
+        import agent.indexer as indexer_mod
+
+        original = indexer_mod._index_single_file
+        calls: list[str] = []
+
+        def wrapped(*args, **kwargs):
+            rel_path = kwargs.get("rel_path")
+            if isinstance(rel_path, str):
+                calls.append(rel_path)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(indexer_mod, "_index_single_file", wrapped)
+
+        updated_payload = "# Version 2\n\n" + sha1(b"changed").hexdigest() + "\n"
+        _write(target, updated_payload)
+        updated_index = build_codebase_index(tmp_path, use_persistent_cache=True)
+
+        assert any(file.path == "docs/invalidate.md" for file in updated_index.files)
+        assert calls == ["docs/invalidate.md"]
 
     def test_search_chunks_and_neighbor_expansion_preserve_section_context(self, tmp_path: Path) -> None:
         content = "\n".join(

@@ -40,7 +40,7 @@ from agent.token_utils import (
     sanitize_tool_message_sequence,
     trim_text_to_token_budget,
 )
-from agent.tools import ALL_TOOLS, set_workspace_root
+from agent.tools import ALL_TOOLS, set_tool_runtime_policy, set_workspace_root
 
 
 # ===================================================================
@@ -66,9 +66,13 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
 
     # Set the workspace root explicitly for tools (avoids Path.cwd() dependency)
     set_workspace_root(ws)
+    set_tool_runtime_policy(
+        timeout_seconds=config.shell_timeout_seconds,
+        allow_dangerous_shell_commands=config.allow_dangerous_shell_commands,
+    )
 
     # Build index (use resolved absolute path)
-    index = build_codebase_index(ws)
+    index = build_codebase_index(ws, use_persistent_cache=config.index_cache_enabled)
 
     # Detect environment
     env_facts = _probe_environment(ws)
