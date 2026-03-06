@@ -48,13 +48,88 @@ Sub-agents (separate LLM calls, outside main budget):
 - `OPENAI_API_KEY` environment variable set
 - Build tooling: `cmake` and at least one backend (`ninja`, `make`, or `mingw32-make`)
 
-## Installation
+## Quick Start (From Scratch)
+
+### 1) Clone and enter the project
 
 ```bash
 git clone https://github.com/<your-username>/limited_token_agent_code_runner.git
 cd limited_token_agent_code_runner
+```
+
+### 2) Create and activate a virtual environment
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 3) Install dependencies
+
+```bash
 pip install -r requirements.txt
 ```
+
+### 4) Set required environment variables
+
+Windows PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY="sk-..."
+```
+
+macOS/Linux:
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+Optional (if your default model is unavailable):
+
+Windows PowerShell:
+
+```powershell
+$env:AGENT_MODEL="gpt-4o-mini"
+```
+
+macOS/Linux:
+
+```bash
+export AGENT_MODEL=gpt-4o-mini
+```
+
+### 5) Verify required local codebase exists
+
+This project expects a pre-downloaded target repo at `workspace/json/`.
+
+```bash
+# from project root
+ls workspace/json
+```
+
+If `workspace/json/` is missing, place your local nlohmann/json copy there before running the agent.
+
+### 6) Run the agent
+
+```bash
+python main.py
+```
+
+### 7) Try a smoke test in the REPL
+
+- `What does include/nlohmann/json.hpp do?`
+- `build the project`
+- `run ctest`
+- `exit`
 
 ## Configuration
 
@@ -112,7 +187,8 @@ agent/
   subagents.py          # Sub-agent modules (retrieval, tool summarizer, compressor, multi-hop)
   model_utils.py        # Model detection, ChatOpenAI construction, response normalization
   token_utils.py        # Token counting, trimming, budget fitting, message sanitization
-DOCUMENTATION.md        # Comprehensive technical reference (architecture, data flow, module docs)
+document.md             # Comprehensive technical reference (architecture, data flow, module docs)
+report.md               # Technical report version for supervisor review
 README.md
 requirements.txt
 workspace/json/         # Pre-downloaded nlohmann/json codebase (not agent source)
@@ -121,7 +197,7 @@ logs/
 
 ## Design Document
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for the complete architecture walkthrough, including:
+See [document.md](document.md) for the complete architecture walkthrough, including:
 - Module-by-module reference
 - Data flow diagrams
 - Token budget deep dive
