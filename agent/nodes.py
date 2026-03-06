@@ -61,9 +61,6 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
             "turn_count": 0,
         }
 
-    # Change working directory to the workspace
-    os.chdir(ws)
-
     # Set the workspace root explicitly for tools (avoids Path.cwd() dependency)
     set_workspace_root(ws)
     set_tool_runtime_policy(
@@ -72,7 +69,11 @@ def index_workspace(state: AgentState, config: AgentConfig) -> dict[str, Any]:
     )
 
     # Build index (use resolved absolute path)
-    index = build_codebase_index(ws, use_persistent_cache=config.index_cache_enabled)
+    index = build_codebase_index(
+        ws,
+        use_persistent_cache=config.index_cache_enabled,
+        cache_directory=config.cache_directory,
+    )
 
     # Detect environment
     env_facts = _probe_environment(ws)

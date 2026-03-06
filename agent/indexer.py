@@ -124,18 +124,24 @@ _CPP_FALSE_POSITIVES = {"if", "for", "while", "switch", "return", "catch", "size
 def build_codebase_index(
     workspace_path: Path,
     use_persistent_cache: bool = True,
+    cache_directory: Path | None = None,
 ) -> CodebaseIndex:
     """Walk the workspace and build file, symbol, chunk, and summary indexes."""
-    root = str(workspace_path.resolve())
+    resolved_workspace = workspace_path.resolve()
+    root = str(resolved_workspace)
     files: list[FileEntry] = []
     symbols: list[SymbolEntry] = []
     chunks: list[ChunkEntry] = []
     chunks_by_file: dict[str, list[int]] = {}
 
-    cached_records = _load_cached_records(workspace_path) if use_persistent_cache else {}
+    cached_records = (
+        _load_cached_records(resolved_workspace, cache_directory)
+        if use_persistent_cache
+        else {}
+    )
     records_to_cache: dict[str, dict[str, object]] = {}
 
-    for filepath in _iter_workspace_files(workspace_path):
+    for filepath in _iter_workspace_files(resolved_workspace):
         ext = filepath.suffix.lower()
         lang = _LANG_MAP.get(ext, "other")
 
@@ -147,7 +153,7 @@ def build_codebase_index(
         if stat.st_size > _MAX_INDEX_FILE_BYTES:
             continue
 
-        rel_path = str(filepath.relative_to(workspace_path)).replace("\\", "/")
+        rel_path = str(filepath.relative_to(resolved_workspace)).replace("\\", "/")
         fingerprint = _file_fingerprint(stat)
         cached_record = cached_records.get(rel_path)
         if cached_record is not None and cached_record.get("fingerprint") == fingerprint:
@@ -180,7 +186,7 @@ def build_codebase_index(
     repository_summary = _build_repository_summary(files)
 
     if use_persistent_cache:
-        _save_cached_records(workspace_path, repository_summary, records_to_cache)
+        _save_cached_records(resolved_workspace, cache_directory, repository_summary, records_to_cache)
 
     return CodebaseIndex(
         root=root,
@@ -204,8 +210,10 @@ def _iter_workspace_files(workspace_path: Path) -> Iterable[Path]:
             yield filepath
 
 
-def _cache_file_path(workspace_path: Path) -> Path:
-    return workspace_path / _INDEX_CACHE_FILE_NAME
+def _cache_file_path(workspace_path: Path, cache_directory: Path | None) -> Path:
+    if cache_directory is not None:
+        return cache_directory.resolve() / _INDEX_CACHE_FILE_NAME
+    return workspace_path.parent / ".cache" / _INDEX_CACHE_FILE_NAME
 
 
 def _file_fingerprint(stat: os.stat_result) -> dict[str, int]:
@@ -215,8 +223,11 @@ def _file_fingerprint(stat: os.stat_result) -> dict[str, int]:
     }
 
 
-def _load_cached_records(workspace_path: Path) -> dict[str, dict[str, object]]:
-    cache_path = _cache_file_path(workspace_path)
+def _load_cached_records(
+    workspace_path: Path,
+    cache_directory: Path | None,
+) -> dict[str, dict[str, object]]:
+    cache_path = _cache_file_path(workspace_path, cache_directory)
     if not cache_path.exists():
         return {}
 
@@ -237,19 +248,27 @@ def _load_cached_records(workspace_path: Path) -> dict[str, dict[str, object]]:
 
 def _save_cached_records(
     workspace_path: Path,
+    cache_directory: Path | None,
     repository_summary: str,
     records: dict[str, dict[str, object]],
 ) -> None:
-    cache_path = _cache_file_path(workspace_path)
+    cache_path = _cache_file_path(workspace_path, cache_directory)
+    temp_path = cache_path.with_name(f"{cache_path.name}.tmp")
     payload = {
         "version": _INDEX_CACHE_VERSION,
         "repository_summary": repository_summary,
         "records": records,
     }
     try:
-        with gzip.open(cache_path, "wt", encoding="utf-8") as handle:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(temp_path, "wt", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False)
-    except OSError:
+        os.replace(temp_path, cache_path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
 
@@ -332,10 +351,8 @@ def _index_large_text_file(
     stat: os.stat_result,
     lang: str,
 ) -> tuple[FileEntry, list[ChunkEntry], list[SymbolEntry]]:
-    lines = _read_text_lines_streaming(filepath)
-    content_preview = _preview_from_lines(lines)
+    content_preview, file_chunks = _chunk_large_text_file_streaming(filepath, rel_path, lang)
     purpose = _detect_file_purpose(content_preview, filepath, lang)
-    file_chunks = _chunk_lines(rel_path, lines, lang)
     declarations = _collect_file_declarations(file_chunks, content_preview, lang)
     summary = _build_file_summary(
         file_chunks=file_chunks,
@@ -358,15 +375,128 @@ def _index_large_text_file(
     return file_entry, file_chunks, []
 
 
-def _read_text_lines_streaming(filepath: Path) -> list[str]:
-    lines: list[str] = []
+def _chunk_large_text_file_streaming(
+    filepath: Path,
+    rel_path: str,
+    lang: str,
+    preview_char_budget: int = 20_000,
+) -> tuple[str, list[ChunkEntry]]:
+    max_chunk_lines = _max_chunk_lines(lang)
+    max_buffer_lines = max_chunk_lines + _MIN_CHUNK_LINES
+    preview_parts: list[str] = []
+    preview_chars = 0
+    buffer_lines: list[str] = []
+    buffer_start_line = 1
+    chunks: list[ChunkEntry] = []
+
+    for line in _read_text_lines_streaming(filepath):
+        if preview_chars < preview_char_budget:
+            remaining_chars = preview_char_budget - preview_chars
+            preview_fragment = line[:remaining_chars]
+            preview_parts.append(preview_fragment)
+            preview_chars += len(preview_fragment) + 1
+
+        buffer_lines.append(line)
+        while len(buffer_lines) >= max_buffer_lines:
+            flush_count = _select_streaming_flush_line_count(buffer_lines, lang, max_chunk_lines)
+            _append_streaming_chunk(
+                chunks=chunks,
+                rel_path=rel_path,
+                lang=lang,
+                start_line=buffer_start_line,
+                lines=buffer_lines[:flush_count],
+            )
+            buffer_lines = buffer_lines[flush_count:]
+            buffer_start_line += flush_count
+
+    if buffer_lines:
+        if chunks:
+            previous_chunk = chunks[-1]
+            previous_chunk_length = previous_chunk.end_line - previous_chunk.start_line + 1
+            combined_length = previous_chunk_length + len(buffer_lines)
+            if len(buffer_lines) < _MIN_CHUNK_LINES and combined_length <= max_chunk_lines + (_MIN_CHUNK_LINES // 2):
+                chunks.pop()
+                _append_streaming_chunk(
+                    chunks=chunks,
+                    rel_path=rel_path,
+                    lang=lang,
+                    start_line=previous_chunk.start_line,
+                    lines=previous_chunk.text.splitlines() + buffer_lines,
+                )
+            else:
+                _append_streaming_chunk(
+                    chunks=chunks,
+                    rel_path=rel_path,
+                    lang=lang,
+                    start_line=buffer_start_line,
+                    lines=buffer_lines,
+                )
+        else:
+            _append_streaming_chunk(
+                chunks=chunks,
+                rel_path=rel_path,
+                lang=lang,
+                start_line=buffer_start_line,
+                lines=buffer_lines,
+            )
+
+    return "\n".join(preview_parts), chunks
+
+
+def _read_text_lines_streaming(filepath: Path) -> Iterable[str]:
     try:
         with filepath.open("r", encoding="utf-8", errors="ignore") as handle:
             for raw_line in handle:
-                lines.append(raw_line.rstrip("\n\r"))
+                yield raw_line.rstrip("\n\r")
     except OSError:
-        return []
-    return lines
+        return
+
+
+def _select_streaming_flush_line_count(
+    lines: list[str],
+    lang: str,
+    max_chunk_lines: int,
+) -> int:
+    candidate_lines = lines[: max_chunk_lines + _MIN_CHUNK_LINES]
+    boundaries = _detect_semantic_boundaries(candidate_lines, lang)
+    split_at = _find_split_point(candidate_lines, 1, max_chunk_lines, boundaries)
+    if split_at < _MIN_CHUNK_LINES:
+        return max_chunk_lines
+    return min(split_at, max_chunk_lines)
+
+
+def _append_streaming_chunk(
+    chunks: list[ChunkEntry],
+    rel_path: str,
+    lang: str,
+    start_line: int,
+    lines: list[str],
+) -> None:
+    if not lines:
+        return
+
+    chunk_text = "\n".join(lines)
+    if not chunk_text.strip():
+        return
+
+    local_boundaries = _detect_semantic_boundaries(lines, lang)
+    declarations = _extract_declarations(chunk_text, lang)
+    symbol_names = _extract_chunk_symbol_names(chunk_text, lang)
+    heading = _chunk_heading(local_boundaries, lines, 1, len(lines))
+    summary = _build_chunk_summary(chunk_text, Path(rel_path), lang, heading, declarations, symbol_names)
+    chunks.append(
+        ChunkEntry(
+            file_path=rel_path,
+            language=lang,
+            start_line=start_line,
+            end_line=start_line + len(lines) - 1,
+            summary=summary,
+            heading=heading,
+            symbol_names=symbol_names,
+            declarations=declarations,
+            text=chunk_text,
+        )
+    )
 
 
 def _preview_from_lines(lines: list[str], max_chars: int = 20000) -> str:

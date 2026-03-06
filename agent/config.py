@@ -5,10 +5,8 @@ from pathlib import Path
 import os
 
 
-# The effective output cap — output_token_budget is nominally 1000 but
-# capped lower to leave formatting headroom.  Surfaced here so it is
-# visible in configuration rather than buried in _invoke_llm_with_context.
 _OUTPUT_HEADROOM_CAP = 800
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass(frozen=True)
@@ -40,6 +38,11 @@ class AgentConfig:
     workspace_path: Path = field(
         default_factory=lambda: Path(
             os.getenv("AGENT_WORKSPACE_PATH", "workspace/json")
+        )
+    )
+    cache_directory: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("AGENT_CACHE_DIRECTORY", str(_PROJECT_ROOT / ".cache"))
         )
     )
     # --- Subagent configuration ---
@@ -75,6 +78,11 @@ class AgentConfig:
     )
 
     def __post_init__(self) -> None:
+        workspace_path = self.workspace_path.resolve()
+        cache_directory = self.cache_directory.resolve()
+        object.__setattr__(self, "workspace_path", workspace_path)
+        object.__setattr__(self, "cache_directory", cache_directory)
+
         if self.input_token_budget + self.output_token_budget > self.token_budget:
             raise ValueError(
                 "input_token_budget + output_token_budget must be <= token_budget"
@@ -87,6 +95,8 @@ class AgentConfig:
             raise ValueError("tool_summary_tokens must be < token_budget (5000)")
         if self.shell_timeout_seconds <= 0:
             raise ValueError("shell_timeout_seconds must be > 0")
+        if cache_directory == workspace_path or cache_directory.is_relative_to(workspace_path):
+            raise ValueError("cache_directory must be outside workspace_path")
 
     @property
     def effective_output_budget(self) -> int:

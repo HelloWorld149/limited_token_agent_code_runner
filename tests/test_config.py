@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -40,9 +41,19 @@ class TestAgentConfig:
     def test_new_production_defaults(self) -> None:
         config = AgentConfig()
         assert config.index_cache_enabled is True
+        assert config.cache_directory.name == ".cache"
         assert config.shell_timeout_seconds > 0
         assert config.allow_dangerous_shell_commands is False
 
     def test_shell_timeout_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="shell_timeout_seconds must be > 0"):
             AgentConfig(shell_timeout_seconds=0)
+
+    def test_cache_directory_must_be_outside_workspace(self, tmp_path: Path) -> None:
+        workspace_path = tmp_path / "workspace" / "json"
+        cache_directory = workspace_path / ".cache"
+        with pytest.raises(ValueError, match="cache_directory must be outside workspace_path"):
+            AgentConfig(
+                workspace_path=workspace_path,
+                cache_directory=cache_directory,
+            )

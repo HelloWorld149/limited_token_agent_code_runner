@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from agent.tools import (
+    _build_tool_env,
     _execute_shell_command_impl,
     _extract_ctest_summary,
     _extract_error_hint,
@@ -124,23 +125,60 @@ class TestWorkspaceRoot:
         set_workspace_root(tmp_path)
         assert get_workspace_root() == tmp_path.resolve()
 
-    def test_falls_back_to_cwd_when_unset(self) -> None:
+    def test_raises_when_unset(self) -> None:
         # Reset to None via module internals for test isolation
         import agent.tools as tools_mod
         old = tools_mod._workspace_root
         tools_mod._workspace_root = None
         try:
-            assert get_workspace_root() == Path.cwd()
+            with pytest.raises(RuntimeError, match="workspace root is not configured"):
+                get_workspace_root()
         finally:
             tools_mod._workspace_root = old
 
 
 class TestExecuteShellCommandSafety:
+    def test_build_tool_env_filters_sensitive_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "secret")
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+        env = _build_tool_env()
+        assert "OPENAI_API_KEY" not in env
+        assert "PATH" in env
+
     def test_blocks_dangerous_commands_by_default(self) -> None:
         set_tool_runtime_policy(timeout_seconds=30, allow_dangerous_shell_commands=False)
         result = _execute_shell_command_impl("curl https://example.com")
         assert "[exit_code]=126" in result
         assert "blocked by safety policy" in result
+
+    def test_rejects_non_allowlisted_executable(self, tmp_path: Path) -> None:
+        set_workspace_root(tmp_path)
+        set_tool_runtime_policy(timeout_seconds=30, allow_dangerous_shell_commands=False)
+        result = _execute_shell_command_impl("unknown-tool --help")
+        assert "[exit_code]=126" in result
+        assert "not permitted by the safety allowlist" in result
+
+    def test_safe_execution_uses_shell_false(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        import agent.tools as tools_mod
+
+        set_workspace_root(tmp_path)
+        set_tool_runtime_policy(timeout_seconds=30, allow_dangerous_shell_commands=False)
+
+        observed: dict[str, object] = {}
+
+        monkeypatch.setattr(tools_mod.shutil, "which", lambda *_args, **_kwargs: str(tmp_path / "python.exe"))
+
+        def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            observed["args"] = args[0]
+            observed["shell"] = kwargs["shell"]
+            return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        result = _execute_shell_command_impl("python --version")
+
+        assert observed["shell"] is False
+        assert isinstance(observed["args"], list)
+        assert "[exit_code]=0" in result
 
     def test_reports_timeout(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         set_workspace_root(tmp_path)

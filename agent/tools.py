@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 from typing import Iterable
 
@@ -19,6 +21,50 @@ from agent.indexer import SKIP_DIRS, SKIP_EXTENSIONS
 _workspace_root: Path | None = None
 _TOOL_TIMEOUT_SECONDS = 120
 _ALLOW_DANGEROUS_SHELL_COMMANDS = False
+_ALLOWED_EXECUTABLES = {
+    "bazel",
+    "c++",
+    "cc",
+    "clang",
+    "clang++",
+    "cmake",
+    "ctest",
+    "g++",
+    "gcc",
+    "make",
+    "meson",
+    "mingw32-make",
+    "msbuild",
+    "ninja",
+    "nmake",
+    "python",
+    "python3",
+    "pytest",
+}
+_ALLOWED_ENV_KEYS = {
+    "CC",
+    "CLICOLOR",
+    "CMAKE_GENERATOR",
+    "CMAKE_MAKE_PROGRAM",
+    "COMSPEC",
+    "HOME",
+    "INCLUDE",
+    "LANG",
+    "LC_ALL",
+    "LIB",
+    "LIBPATH",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "PYTHONIOENCODING",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+}
+_UNSAFE_SHELL_TOKENS = {"|", "||", "&&", ";", ">", ">>", "<", "2>", "2>>"}
 
 _BLOCKED_COMMAND_PATTERNS = [
     re.compile(r"(^|[\s;&|])(curl|wget|Invoke-WebRequest|iwr)\b", re.IGNORECASE),
@@ -45,10 +91,10 @@ def set_tool_runtime_policy(
 
 
 def get_workspace_root() -> Path:
-    """Return the workspace root, falling back to cwd if not set explicitly."""
+    """Return the configured workspace root."""
     if _workspace_root is not None:
         return _workspace_root
-    return Path.cwd()
+    raise RuntimeError("workspace root is not configured; call set_workspace_root() first")
 
 
 # ---------------------------------------------------------------------------
@@ -112,13 +158,13 @@ def _truncate_output(text: str, max_chars: int = 3000) -> str:
 
 
 def _normalize_command_for_platform(cmd: str) -> str:
-    """Normalize Unix-isms to Windows-compatible commands when running on Windows."""
+    """Normalize Unix-isms to safer platform-compatible commands."""
+    normalized = cmd.strip()
+    normalized = normalized.replace("$(nproc)", str(max(1, os.cpu_count() or 1)))
     if os.name != "nt":
-        return cmd
+        return normalized
 
-    normalized = cmd
     normalized = re.sub(r"(^|[\s;&|])\./", r"\1", normalized)
-    normalized = normalized.replace("$(nproc)", "%NUMBER_OF_PROCESSORS%")
     normalized = re.sub(r"\bexport\s+(\w+)=", r"set \1=", normalized)
     normalized = re.sub(r"\brm\s+-rf\s+(\S+)", r"rmdir /s /q \1", normalized)
     normalized = re.sub(r"\brm\s+-f\s+(\S+)", r"del /f \1", normalized)
@@ -137,15 +183,56 @@ def _validate_command_policy(cmd: str) -> str | None:
     for pattern in _BLOCKED_COMMAND_PATTERNS:
         if pattern.search(stripped):
             return "command blocked by safety policy"
+
+    if any(token in stripped for token in _UNSAFE_SHELL_TOKENS):
+        return "command uses unsupported shell features; run a single executable command"
     return None
 
 
 def _build_tool_env() -> dict[str, str]:
     """Provide a minimal, stable environment for build and test commands."""
-    env = dict(os.environ)
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper_key = key.upper()
+        if upper_key in _ALLOWED_ENV_KEYS or upper_key.startswith("CMAKE_"):
+            env[key] = value
+
+    env.setdefault("PATH", os.defpath)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("CLICOLOR", "0")
     return env
+
+
+def _parse_command_args(cmd: str) -> list[str]:
+    try:
+        args = shlex.split(cmd, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"unable to parse command: {exc}") from exc
+
+    if not args:
+        raise ValueError("empty command")
+    if any(arg in _UNSAFE_SHELL_TOKENS for arg in args[1:]):
+        raise ValueError("command uses unsupported shell features; run a single executable command")
+    return args
+
+
+def _normalized_executable_name(executable: str) -> str:
+    name = Path(executable).name.lower()
+    if name.endswith(".exe"):
+        return name[:-4]
+    return name
+
+
+def _resolve_safe_command(args: list[str], env: dict[str, str]) -> list[str]:
+    executable_name = _normalized_executable_name(args[0])
+    if executable_name not in _ALLOWED_EXECUTABLES:
+        raise ValueError(f"executable '{args[0]}' is not permitted by the safety allowlist")
+
+    resolved_executable = shutil.which(args[0], path=env.get("PATH"))
+    if resolved_executable is None:
+        raise FileNotFoundError(f"executable not found: {args[0]}")
+
+    return [resolved_executable, *args[1:]]
 
 
 def _format_command_result(
@@ -194,15 +281,43 @@ def _execute_shell_command_impl(cmd: str) -> str:
             timed_out=False,
         )
 
+    env = _build_tool_env()
+    try:
+        workspace_root = get_workspace_root()
+    except RuntimeError as exc:
+        return _format_command_result(
+            normalized_cmd=normalized_cmd,
+            exit_code=125,
+            stdout="",
+            stderr=str(exc),
+            timed_out=False,
+        )
+
+    run_args: str | list[str]
+    use_shell = _ALLOW_DANGEROUS_SHELL_COMMANDS
+    if use_shell:
+        run_args = normalized_cmd
+    else:
+        try:
+            run_args = _resolve_safe_command(_parse_command_args(normalized_cmd), env)
+        except (FileNotFoundError, ValueError) as exc:
+            return _format_command_result(
+                normalized_cmd=normalized_cmd,
+                exit_code=126,
+                stdout="",
+                stderr=str(exc),
+                timed_out=False,
+            )
+
     try:
         completed = subprocess.run(
-            normalized_cmd,
-            shell=True,
+            run_args,
+            shell=use_shell,
             text=True,
             capture_output=True,
-            cwd=str(get_workspace_root()),
+            cwd=str(workspace_root),
             timeout=_TOOL_TIMEOUT_SECONDS,
-            env=_build_tool_env(),
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
@@ -348,7 +463,10 @@ def search_codebase(regex_pattern: str) -> str:
     except re.error as exc:
         return f"invalid regex: {exc}"
 
-    root = get_workspace_root()
+    try:
+        root = get_workspace_root()
+    except RuntimeError as exc:
+        return str(exc)
     matches: list[str] = []
     max_matches = 60
 
