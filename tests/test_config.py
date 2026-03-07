@@ -38,7 +38,20 @@ class TestAgentConfig:
         assert config.effective_output_budget <= config.output_token_budget
         assert config.effective_output_budget == min(config.output_token_budget, 800)
 
-    def test_new_production_defaults(self) -> None:
+    def test_new_production_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for env_var in (
+            "AGENT_INDEX_CACHE_ENABLED",
+            "AGENT_USE_EMBEDDING_RETRIEVAL",
+            "AGENT_EMBEDDING_PROVIDER",
+            "AGENT_EMBEDDING_MODEL",
+            "AGENT_EMBEDDING_DIMENSIONS",
+            "AGENT_BACKGROUND_REINDEX_ENABLED",
+            "AGENT_BACKGROUND_REINDEX_INTERVAL_SECONDS",
+            "AGENT_SHELL_TIMEOUT_SECONDS",
+            "AGENT_ALLOW_DANGEROUS_SHELL_COMMANDS",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+
         config = AgentConfig()
         assert config.index_cache_enabled is True
         assert config.use_embedding_retrieval is False

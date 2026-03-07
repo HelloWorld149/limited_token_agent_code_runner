@@ -50,6 +50,7 @@ _LANG_MAP: dict[str, str] = {
 SKIP_DIRS = {
     ".git",
     "build",
+    "build-user",
     "build-mingw",
     "build-ninja",
     "__pycache__",
@@ -455,9 +456,15 @@ def _iter_workspace_files(workspace_path: Path) -> Iterable[Path]:
 
 
 def _cache_file_path(workspace_path: Path, cache_directory: Path | None) -> Path:
-    if cache_directory is not None:
-        return cache_directory.resolve() / _INDEX_CACHE_FILE_NAME
-    return workspace_path.parent / ".cache" / _INDEX_CACHE_FILE_NAME
+    resolved_workspace = workspace_path.resolve()
+    base_cache_dir = (
+        cache_directory.resolve()
+        if cache_directory is not None
+        else resolved_workspace.parent / ".cache"
+    )
+    workspace_key = sha1(str(resolved_workspace).encode("utf-8")).hexdigest()[:12]
+    workspace_cache_dir = base_cache_dir / f"{resolved_workspace.name}-{workspace_key}"
+    return workspace_cache_dir / _INDEX_CACHE_FILE_NAME
 
 
 def _file_fingerprint(stat: os.stat_result) -> dict[str, int]:

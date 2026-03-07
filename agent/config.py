@@ -68,7 +68,7 @@ class AgentConfig:
         default_factory=lambda: int(os.getenv("AGENT_TOOL_SUMMARY_TOKENS", "200"))
     )
     index_cache_enabled: bool = field(
-        default_factory=lambda: os.getenv("AGENT_INDEX_CACHE_ENABLED", "true").lower() == "true"
+        default_factory=lambda: os.getenv("AGENT_INDEX_CACHE_ENABLED", "false").lower() == "true"
     )
     use_embedding_retrieval: bool = field(
         default_factory=lambda: os.getenv("AGENT_USE_EMBEDDING_RETRIEVAL", "true").lower() == "true"
@@ -77,7 +77,7 @@ class AgentConfig:
         default_factory=lambda: (os.getenv("AGENT_EMBEDDING_PROVIDER", "openai") or "openai").strip().lower()
     )
     embedding_model: str = field(
-        default_factory=lambda: os.getenv("AGENT_EMBEDDING_MODEL", "text-embedding-3-large")
+        default_factory=lambda: os.getenv("AGENT_EMBEDDING_MODEL", "text-embedding-3-small")
     )
     embedding_dimensions: int = field(
         default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_DIMENSIONS", "256"))

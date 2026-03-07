@@ -32,6 +32,11 @@ def _cache_dir_for(workspace_path: Path) -> Path:
     return workspace_path.parent / f"{workspace_path.name}-cache"
 
 
+def _cache_file_for(workspace_path: Path, cache_dir: Path) -> Path:
+    workspace_key = sha1(str(workspace_path.resolve()).encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"{workspace_path.name}-{workspace_key}" / ".codebase_index_cache_v3.json.gz"
+
+
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -96,8 +101,17 @@ class TestChunkAwareIndexing:
         second_index = build_codebase_index(tmp_path, use_persistent_cache=True, cache_directory=cache_dir)
         assert any(file.path == "docs/cached.md" for file in second_index.files)
         assert calls == []
-        assert (cache_dir / ".codebase_index_cache_v3.json.gz").exists()
+        assert _cache_file_for(tmp_path, cache_dir).exists()
         assert not (tmp_path / ".codebase_index_cache_v3.json.gz").exists()
+
+    def test_build_user_directory_is_skipped(self, tmp_path: Path) -> None:
+        _write(tmp_path / "src" / "main.cpp", "int main() { return 0; }\n")
+        _write(tmp_path / "build-user" / "generated.cpp", "int generated() { return 1; }\n")
+
+        index = build_codebase_index(tmp_path, use_persistent_cache=False)
+
+        assert any(file.path == "src/main.cpp" for file in index.files)
+        assert not any(file.path.startswith("build-user/") for file in index.files)
 
     def test_persistent_cache_invalidates_changed_files(self, tmp_path: Path, monkeypatch) -> None:
         target = tmp_path / "docs" / "invalidate.md"
@@ -131,7 +145,7 @@ class TestChunkAwareIndexing:
         _write(target, "# Cached\n\nalpha\n")
 
         build_codebase_index(tmp_path, use_persistent_cache=True, cache_directory=cache_dir)
-        cache_file = cache_dir / ".codebase_index_cache_v3.json.gz"
+        cache_file = _cache_file_for(tmp_path, cache_dir)
         original_payload = cache_file.read_bytes()
 
         import agent.indexer as indexer_mod
@@ -181,7 +195,7 @@ class TestChunkAwareIndexing:
             use_embedding_retrieval=True,
         )
 
-        cache_file = cache_dir / ".codebase_index_cache_v3.json.gz"
+        cache_file = _cache_file_for(tmp_path, cache_dir)
         with gzip.open(cache_file, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
 
@@ -482,6 +496,7 @@ class TestChunkAwareRetrieval:
             classifier_model=MODEL,
             subagent_model=MODEL,
             workspace_path=tmp_path,
+            use_embedding_retrieval=True,
             use_retrieval_subagent=False,
             use_tool_summarizer=False,
             use_conversation_compressor=False,
@@ -546,6 +561,7 @@ class TestChunkAwareRetrieval:
             classifier_model=MODEL,
             subagent_model=MODEL,
             workspace_path=tmp_path,
+            use_embedding_retrieval=False,
             use_retrieval_subagent=False,
             use_tool_summarizer=False,
             use_conversation_compressor=False,
