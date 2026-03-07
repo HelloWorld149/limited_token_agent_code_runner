@@ -71,7 +71,7 @@ class AgentConfig:
         default_factory=lambda: os.getenv("AGENT_INDEX_CACHE_ENABLED", "true").lower() == "true"
     )
     use_embedding_retrieval: bool = field(
-        default_factory=lambda: os.getenv("AGENT_USE_EMBEDDING_RETRIEVAL", "false").lower() == "true"
+        default_factory=lambda: os.getenv("AGENT_USE_EMBEDDING_RETRIEVAL", "true").lower() == "true"
     )
     embedding_provider: str = field(
         default_factory=lambda: (os.getenv("AGENT_EMBEDDING_PROVIDER", "openai") or "openai").strip().lower()
@@ -83,10 +83,10 @@ class AgentConfig:
         default_factory=lambda: int(os.getenv("AGENT_EMBEDDING_DIMENSIONS", "256"))
     )
     background_reindex_enabled: bool = field(
-        default_factory=lambda: os.getenv("AGENT_BACKGROUND_REINDEX_ENABLED", "false").lower() == "true"
+        default_factory=lambda: os.getenv("AGENT_BACKGROUND_REINDEX_ENABLED", "true").lower() == "true"
     )
     background_reindex_interval_seconds: float = field(
-        default_factory=lambda: float(os.getenv("AGENT_BACKGROUND_REINDEX_INTERVAL_SECONDS", "60"))
+        default_factory=lambda: float(os.getenv("AGENT_BACKGROUND_REINDEX_INTERVAL_SECONDS", "180"))
     )
     shell_timeout_seconds: int = field(
         default_factory=lambda: int(os.getenv("AGENT_SHELL_TIMEOUT_SECONDS", "1500"))
