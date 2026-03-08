@@ -269,8 +269,62 @@ def _format_command_result(
     return _truncate_output(combined)
 
 
+_CD_PREFIX_RE = re.compile(
+    r"^\s*(?:cd\s+(?:/d\s+)?[\"']?[\w:\\/.~\- ]+[\"']?\s*[;&]+\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _strip_cd_prefix(cmd: str) -> str:
+    """Remove leading 'cd <path> && ' or 'cd /d <path> ; ' patterns.
+
+    The execute_shell_command tool always runs from the workspace root, so
+    cd prefixes are redundant and cause policy failures with '&&'.
+    """
+    return _CD_PREFIX_RE.sub("", cmd).strip()
+
+
+def _split_chained_commands(cmd: str) -> list[str]:
+    """Split '&&'-chained commands into individual commands.
+
+    Returns a list of individual commands. If there are no chains, returns
+    a single-element list with the original command.
+    """
+    # Only split on && — not on |, ||, ;, etc. which remain blocked
+    parts = [part.strip() for part in re.split(r"\s*&&\s*", cmd) if part.strip()]
+    return parts if parts else [cmd]
+
+
 def _execute_shell_command_impl(cmd: str) -> str:
     normalized_cmd = _normalize_command_for_platform(cmd)
+
+    # Auto-strip leading cd prefixes (cwd is already the workspace root)
+    normalized_cmd = _strip_cd_prefix(normalized_cmd)
+    if not normalized_cmd.strip():
+        return _format_command_result(
+            normalized_cmd=cmd,
+            exit_code=0,
+            stdout="(cd-only command stripped; cwd is already the workspace root)",
+            stderr="",
+            timed_out=False,
+        )
+
+    # Split && chains into individual commands and execute sequentially
+    sub_commands = _split_chained_commands(normalized_cmd)
+    if len(sub_commands) > 1:
+        all_results: list[str] = []
+        for sub_cmd in sub_commands:
+            result = _execute_single_command(sub_cmd)
+            all_results.append(result)
+            # Stop on first failure (mimics && semantics)
+            if "[exit_code]=0" not in result:
+                break
+        return "\n\n".join(all_results)
+
+    return _execute_single_command(normalized_cmd)
+
+
+def _execute_single_command(normalized_cmd: str) -> str:
     policy_error = _validate_command_policy(normalized_cmd)
     if policy_error is not None:
         return _format_command_result(
@@ -374,7 +428,7 @@ def _extract_error_hint(stdout: str, stderr: str) -> str | None:
 
 @tool
 def execute_shell_command(cmd: str) -> str:
-    """Run a shell command and capture both stdout and stderr with truncation logic."""
+    """Run a shell command from the workspace root directory. Do NOT use 'cd' or '&&' chaining — run one command at a time. Example: 'cmake -S . -B build -G Ninja'."""
     return _execute_shell_command_impl(cmd)
 
 

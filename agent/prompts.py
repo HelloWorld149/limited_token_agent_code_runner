@@ -30,6 +30,8 @@ Rules:
 4. Suggest concrete next steps when a build fails.
 5. On Windows, use Windows-compatible commands.
 6. Keep output concise and action-oriented.
+7. The execute_shell_command tool already runs from the workspace root directory. Do NOT use 'cd' to change directory. Do NOT chain commands with '&&' or ';'. Call execute_shell_command once per command.
+8. Example commands: 'cmake -S . -B build -G Ninja', 'cmake --build build --parallel', 'ctest --test-dir build'.
 """.strip()
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,8 @@ Rules:
 3. Identify failing tests and explain likely causes.
 4. Never modify the project's source code.
 5. Keep output concise with clear test result summaries.
+6. The execute_shell_command tool already runs from the workspace root directory. Do NOT use 'cd' or chain commands with '&&'. Call execute_shell_command once per command.
+7. Example: 'ctest --test-dir build --output-on-failure'.
 """.strip()
 
 # ---------------------------------------------------------------------------

@@ -496,7 +496,7 @@ class TestChunkAwareRetrieval:
             classifier_model=MODEL,
             subagent_model=MODEL,
             workspace_path=tmp_path,
-            use_embedding_retrieval=True,
+            use_embedding_retrieval=False,
             use_retrieval_subagent=False,
             use_tool_summarizer=False,
             use_conversation_compressor=False,

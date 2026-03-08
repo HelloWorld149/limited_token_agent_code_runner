@@ -371,6 +371,8 @@ def build_codebase_index(
         else {}
     )
     records_to_cache: dict[str, dict[str, object]] = {}
+    chunks_needing_embeddings: list[ChunkEntry] = []
+    _pending_embedding_records: list[tuple[str, list[ChunkEntry]]] = []
 
     for filepath in _iter_workspace_files(resolved_workspace):
         ext = filepath.suffix.lower()
@@ -387,6 +389,7 @@ def build_codebase_index(
         rel_path = str(filepath.relative_to(resolved_workspace)).replace("\\", "/")
         fingerprint = _file_fingerprint(stat)
         cached_record = cached_records.get(rel_path)
+        needs_embedding = False
         if cached_record is not None and cached_record.get("fingerprint") == fingerprint:
             file_entry, file_chunks, file_symbols = _deserialize_cached_record(cached_record)
             if embedding_backend is not None and not _cached_record_has_matching_embeddings(
@@ -394,7 +397,7 @@ def build_codebase_index(
                 embedding_signature,
                 len(file_chunks),
             ):
-                _populate_chunk_embeddings(file_chunks, embedding_backend)
+                needs_embedding = True
         else:
             file_entry, file_chunks, file_symbols = _index_single_file(
                 filepath=filepath,
@@ -403,13 +406,18 @@ def build_codebase_index(
                 lang=lang,
             )
             if embedding_backend is not None:
-                _populate_chunk_embeddings(file_chunks, embedding_backend)
+                needs_embedding = True
+
+        if needs_embedding:
+            chunks_needing_embeddings.extend(file_chunks)
+            _pending_embedding_records.append((rel_path, file_chunks))
+
         records_to_cache[rel_path] = _serialize_cached_record(
             fingerprint=fingerprint,
             file_entry=file_entry,
             file_chunks=file_chunks,
             file_symbols=file_symbols,
-            embedding_signature=(embedding_signature if _chunks_have_embeddings(file_chunks) else ""),
+            embedding_signature="",  # placeholder; updated after batched embedding
         )
         files.append(file_entry)
         symbols.extend(file_symbols)
@@ -420,6 +428,18 @@ def build_codebase_index(
             chunks.append(chunk)
         if chunk_indexes:
             chunks_by_file[rel_path] = chunk_indexes
+
+    # Batched embedding: process all chunks that need embeddings in large batches
+    if embedding_backend is not None and chunks_needing_embeddings:
+        _populate_chunk_embeddings_batched(chunks_needing_embeddings, embedding_backend)
+        # Update cache records with embedding signature for files that got embeddings
+        for rel_path, file_chunks in _pending_embedding_records:
+            if rel_path in records_to_cache and _chunks_have_embeddings(file_chunks):
+                records_to_cache[rel_path] = {
+                    **records_to_cache[rel_path],
+                    "embedding_signature": embedding_signature,
+                    "chunks": [asdict(chunk) for chunk in file_chunks],
+                }
 
     files.sort(key=lambda file_entry: file_entry.path)
     symbols.sort(key=lambda symbol: (symbol.file, symbol.line, symbol.name))
@@ -586,6 +606,47 @@ def _populate_chunk_embeddings(
 
     for chunk, vector in zip(file_chunks, vectors, strict=False):
         chunk.embedding = _normalize_vector(vector)
+
+
+_EMBEDDING_BATCH_SIZE = 512
+
+
+def _populate_chunk_embeddings_batched(
+    all_chunks: list[ChunkEntry],
+    backend: _EmbeddingBackend,
+    batch_size: int = _EMBEDDING_BATCH_SIZE,
+) -> None:
+    """Populate embeddings for a large list of chunks in batched API calls.
+
+    This is much faster than calling embed_documents per-file because it
+    reduces the number of API round-trips from O(files) to O(chunks/batch_size).
+    """
+    if not all_chunks:
+        return
+
+    embedding_texts = [_build_chunk_embedding_text(chunk) for chunk in all_chunks]
+    for chunk in all_chunks:
+        chunk.embedding = []
+
+    for batch_start in range(0, len(embedding_texts), batch_size):
+        batch_end = min(batch_start + batch_size, len(embedding_texts))
+        batch_texts = embedding_texts[batch_start:batch_end]
+        batch_chunks = all_chunks[batch_start:batch_end]
+        try:
+            vectors = backend.embed_documents(batch_texts)
+        except Exception as exc:
+            logger.warning(
+                "Failed to populate chunk embeddings batch [%d:%d] with backend=%s model=%s: %s",
+                batch_start,
+                batch_end,
+                backend.backend_name,
+                backend.model_name,
+                _summarize_exception(exc),
+            )
+            continue
+
+        for chunk, vector in zip(batch_chunks, vectors, strict=False):
+            chunk.embedding = _normalize_vector(vector)
 
 
 def _build_chunk_embedding_text(chunk: ChunkEntry) -> str:
